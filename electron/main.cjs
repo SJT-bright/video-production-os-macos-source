@@ -1,0 +1,5041 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { execFile } = require('child_process');
+const { pipeline } = require('stream/promises');
+const {
+  app,
+  BrowserWindow,
+  WebContentsView,
+  clipboard,
+  dialog,
+  Menu,
+  net,
+  ipcMain,
+  nativeImage,
+  nativeTheme,
+  screen,
+  session,
+  shell,
+} = require('electron');
+const { isSafeBrowserAddress, normalizeBrowserAddress } = require('./browser-address.cjs');
+const {
+  SPLIT_GUTTER,
+  disableSplit,
+  publicSplit,
+  paneBounds,
+  planSetSplitView,
+  planSetRatio,
+  planFocusPane,
+  planActivateTab,
+  planTabDestroyed,
+} = require('./split-view-state.cjs');
+const { createCreatorPlatformStore } = require('./creator-platforms.cjs');
+const { createBrowserSessionStore } = require('./browser-session.cjs');
+const { createCreatorFileReadPolicy, authorizeSelectedCreatorFileRead, observeCreatorUploadFailures } = require('./creator-file-access.cjs');
+const { buildCreatorContextMenuTemplate } = require('./creator-context-menu.cjs');
+const { classifyDownload, resolveDownloadTarget, deleteBrowserDownloadFile, sanitizeFilename, uniquePath } = require('./download-router.cjs');
+const { MEDIA_KINDS, episodeLabel, normalizeSnapshot: normalizeEpisodeSnapshot, createDownloadEpisodeStore } = require('./download-episodes.cjs');
+const { createDownloadReview } = require('./download-review.cjs');
+const { createDownloadReviewUI } = require('./download-review-ui.cjs');
+const { createFloatPresentation } = require('./float-presentation.cjs');
+const VideoDisposition = require('../assets/ui/video-disposition.js');
+const { classifyCreativeAsset, ensureCreativeAssetRoot, resolveCreativeAsset, buildCreativeAssetTree } = require('../creative-assets.cjs');
+const { createCreatorAutomation, serveAutomation } = require('./creator-automation.cjs');
+const { resolveMacProjectRootFromBundle, macProjectDataDir } = require('./runtime-project-path.cjs');
+const { windowsReleasePaths } = require('./windows-release-path.cjs');
+
+app.setName('视频制作 OS');
+app.setAppUserModelId('VideoProductionOS.Desktop');
+// 产品当前采用固定的明亮 macOS 工作台；同步原生材质，避免系统深色外观把标题栏与 vibrancy 染黑。
+nativeTheme.themeSource = 'light';
+
+const OS_DIR = path.dirname(__dirname);
+const TEST_MODE = process.env.CREATOR_BROWSER_TEST === '1';
+const SMOKE_TEST = process.env.VIDEO_OS_SMOKE_TEST === '1';
+
+function readRuntimeConfig() {
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(OS_DIR, 'runtime-config.json'), 'utf-8'));
+    return config && typeof config === 'object' ? config : {};
+  } catch {
+    return {};
+  }
+}
+
+const RUNTIME_CONFIG = readRuntimeConfig();
+const CANDIDATE_MODE = Boolean(RUNTIME_CONFIG.candidateId);
+if (CANDIDATE_MODE) {
+  if (!path.isAbsolute(String(RUNTIME_CONFIG.candidateUserData || ''))) throw new Error('候选版必须使用独立的绝对数据路径');
+  app.setPath('userData', RUNTIME_CONFIG.candidateUserData);
+  app.setName('视频制作 OS 候选版');
+  app.setAppUserModelId('VideoProductionOS.AssetWorkflowCandidate');
+} else if (process.env.VIDEO_OS_USER_DATA) app.setPath('userData', path.resolve(process.env.VIDEO_OS_USER_DATA));
+const windowsRelease = windowsReleasePaths({
+  platform: process.platform, isPackaged: app.isPackaged,
+  config: RUNTIME_CONFIG, userData: app.getPath('userData'),
+});
+const macPortable = app.isPackaged && process.platform === 'darwin' && RUNTIME_CONFIG.dataLocation === 'userData';
+const macPortableRoot = macPortable ? path.join(app.getPath('userData'), 'workspace') : '';
+const macPackagedApp = app.isPackaged && process.platform === 'darwin' && !TEST_MODE && !macPortable;
+const explicitProjectRoot = String(process.env.VIDEO_OS_PROJECT_ROOT || '').trim();
+const macProjectRootFromBundle = macPackagedApp ? resolveMacProjectRootFromBundle(OS_DIR) : '';
+if (macPackagedApp && !macProjectRootFromBundle) {
+  throw new Error('macOS App 必须保留在完整项目的 视频制作OS/dist 目录中；移动项目后请双击“启动OS-mac.command”重建 App。');
+}
+const packagedProjectRoot = typeof RUNTIME_CONFIG.projectRoot === 'string' && RUNTIME_CONFIG.projectRoot.trim()
+  ? path.resolve(RUNTIME_CONFIG.projectRoot)
+  : '';
+const PROJECT_ROOT = path.resolve(
+  (CANDIDATE_MODE && path.join(app.getPath('userData'), 'workspace'))
+  || (TEST_MODE && process.env.VIDEO_OS_TEST_PROJECT_ROOT)
+  || macProjectRootFromBundle
+  || explicitProjectRoot
+  || macPortableRoot
+  || windowsRelease?.projectRoot
+  || packagedProjectRoot
+  || path.dirname(OS_DIR)
+);
+const configuredDataDir = (CANDIDATE_MODE && macProjectDataDir(PROJECT_ROOT))
+  || process.env.VIDEO_OS_DATA_DIR
+  || (macPortable ? macProjectDataDir(PROJECT_ROOT) : '')
+  || windowsRelease?.dataDir
+  || (macPackagedApp ? macProjectDataDir(PROJECT_ROOT) : '')
+  || (typeof RUNTIME_CONFIG.dataDir === 'string' && RUNTIME_CONFIG.dataDir.trim() ? RUNTIME_CONFIG.dataDir : '')
+  || path.join(OS_DIR, 'data');
+if (!path.isAbsolute(configuredDataDir)) throw new Error('OS 数据目录必须是绝对路径');
+// Portable releases start without a project directory on another computer.
+// Create only their user-owned workspace before the asset store validates it.
+if (macPortable || windowsRelease) fs.mkdirSync(PROJECT_ROOT, { recursive: true });
+// server.js 在 require 阶段解析项目根和数据目录，桌面发行版必须先注入真实路径。
+process.env.VIDEO_OS_PROJECT_ROOT = PROJECT_ROOT;
+process.env.VIDEO_OS_DATA_DIR = path.resolve(configuredDataDir);
+const serverModule = require('../server.js');
+const CREATIVE_ASSET_DIR = serverModule.creativeAssetDir;
+const mediaSourceStore = serverModule.mediaSourceStore;
+const OBSIDIAN_VAULT = TEST_MODE && process.env.VIDEO_OS_TEST_OBSIDIAN_VAULT
+  ? path.resolve(process.env.VIDEO_OS_TEST_OBSIDIAN_VAULT)
+  : serverModule.obsidianVault;
+const productionStore = serverModule.productionStore;
+const creativeProjectStore = serverModule.creativeProjectStore;
+const START_PORT = Number(process.env.VIDEO_OS_PORT || 3750) || 3750;
+let creatorAutomation = null;
+let creatorAutomationServer = null;
+const COMPATIBILITY_MODE = process.env.VIDEO_OS_ENABLE_GPU !== '1'
+  && (process.env.VIDEO_OS_COMPAT_MODE === '1' || RUNTIME_CONFIG.compatibilityMode === true);
+if (process.env.VIDEO_OS_DISABLE_GPU === '1' || COMPATIBILITY_MODE) {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch('disable-gpu');
+  app.commandLine.appendSwitch('disable-gpu-compositing');
+  app.commandLine.appendSwitch('disable-gpu-rasterization');
+}
+if (COMPATIBILITY_MODE) {
+  // 本机 Chromium 沙箱子进程无法稳定启动；仅发行版/显式兼容模式使用此降级。
+  // Node 集成、权限、协议过滤、上下文隔离与 webSecurity 仍保持收紧。
+  app.commandLine.appendSwitch('no-sandbox');
+}
+// 避免 Chromium 子进程崩溃时留下阻塞式系统弹窗；错误仍会写入 video-os.log。
+app.commandLine.appendSwitch('disable-error-dialogs');
+app.commandLine.appendSwitch('noerrdialogs');
+// 网站兼容性：内嵌浏览器按标准 Chrome 对待。
+// 1) 关闭自动化标记，Cloudflare/Turnstile 不再把它当自动化环境反复验证；
+// 2) 全局 UA 伪装成正式 Chrome（Electron 默认 UA 里的 “Electron/x” 会导致
+//    Google 登录报“不支持 JavaScript/浏览器不安全”并被部分站点降级）。
+app.commandLine.appendSwitch('disable-features', 'AutomationControlled');
+const { isLoginRejectedUrl } = require('./login-reject-url.cjs');
+const CREATOR_BROWSER_UA = `Mozilla/5.0 (${process.platform === 'darwin' ? 'Macintosh; Intel Mac OS X 10_15_7' : 'Windows NT 10.0; Win64; x64'}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36`;
+// 页面加载超时阈值：默认 30 秒；隔离测试可用环境变量调短，避免真实等待。
+const LOAD_TIMEOUT_MS = Number(process.env.VIDEO_OS_LOAD_TIMEOUT_MS) || 30000;
+app.userAgentFallback = CREATOR_BROWSER_UA;
+const SERVICES = Object.freeze({
+  gpt: { id: 'gpt', label: 'GPT', imageLabel: 'GPT 图片', videoLabel: 'GPT 提示词', url: 'https://chatgpt.com/' },
+  gemini: { id: 'gemini', label: 'Gemini', imageLabel: 'Gemini', videoLabel: 'Gemini', url: 'https://gemini.google.com/app' },
+  grok: { id: 'grok', label: 'Grok', imageLabel: 'Grok', videoLabel: 'Grok', url: 'https://grok.com/' },
+  midjourney: { id: 'midjourney', label: 'Midjourney', imageLabel: 'Midjourney', url: 'https://www.midjourney.com/' },
+  updream: { id: 'updream', label: 'Updream', videoLabel: 'Updream', url: 'https://www.updream.cn/' },
+  xiaoyunque: { id: 'xiaoyunque', label: '小云雀', videoLabel: '小云雀', url: 'https://xyq.jianying.com/' },
+  hehui: { id: 'hehui', label: '核绘', imageLabel: '核绘', videoLabel: '核绘', url: 'https://hehui.dawncoreai.com/' },
+  libtv: { id: 'libtv', label: 'LibTV', imageLabel: 'LibTV', videoLabel: 'LibTV', url: 'https://www.liblib.tv/wappro?sourceid=040004' },
+});
+const MODE_SERVICES = Object.freeze({
+  image: ['gpt', 'gemini', 'grok', 'midjourney', 'hehui', 'libtv'],
+  video: ['gpt', 'gemini', 'grok', 'updream', 'xiaoyunque', 'hehui', 'libtv'],
+});
+const MODE_DEFAULTS = Object.freeze({ image: 'gpt', video: 'updream' });
+const creatorPlatformStore = createCreatorPlatformStore({
+  filePath: path.join(app.getPath('userData'), 'creator-platforms.json'),
+  builtinIds: Object.keys(SERVICES),
+  onWarning: message => console.warn(`[creator-platforms] ${message}`),
+});
+const ALLOWED_DOWNLOAD_ACTIONS = new Set(['pause', 'resume', 'cancel']);
+// 标签右键菜单动作白名单：渲染端只传条目描述，点击回调由主进程按这些 id 生成。
+const ALLOWED_TAB_MENU_ACTIONS = new Set([
+  'rename', 'duplicate', 'copy-url', 'pin', 'mute', 'restore',
+  'close-left', 'close-others', 'close-right', 'close',
+]);
+// 这四个动作在 creator 页 DOM 菜单里是红色危险项；native 通道不传外观，菜单窗按白名单 id 补齐。
+const TAB_MENU_DANGER_ACTIONS = new Set(['close-left', 'close-others', 'close-right', 'close']);
+const browserSessionStore = createBrowserSessionStore({
+  filePath: path.join(app.getPath('userData'), 'creator-browser-session.json'),
+  onWarning: message => console.warn(`[browser-session] ${message}`),
+});
+const initialBrowserSession = browserSessionStore.load();
+let initializedModes = { image: false, video: false, ...initialBrowserSession?.initializedModes };
+let restoringBrowserSession = false;
+let closingWorkspace = false;
+let browserSessionRestored = false;
+let lastBrowserSnapshot = '';
+const ALLOWED_NAV_ACTIONS = new Set(['back', 'forward', 'reload', 'stop', 'home', 'hard-reload']);
+const ASSET_PANEL_MIN_WIDTH = 360;
+const ASSET_PANEL_MAX_WIDTH = 760;
+// 拖拽幻影兜底：视频等无法解码为图片的文件，用可见的深底+播放角标占位（1x1 透明图不可见，已弃用）
+const DRAG_FALLBACK_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAX0lEQVRogO3PsQ0AMAgEQXCf7o1jOIagqPZ2M7AzVdM3wBewYcCGET/BhgE7RvwEGwbsGPH/XxcuXMCAAQMGDBgwYMCAAQMGDBgwYMCAAQMGDBgwYMCAAQMGDBgwYMCA4d4E9wB3D7TGtAAAAABJRU5ErkJggg==';
+
+let localServerInfo = null;
+let mainWindow = null;
+let creatorWindow = null;
+let workspaceSurface = '';
+let creatorLayoutReady = false;
+let workspaceNavigation = Promise.resolve();
+let activeView = null;
+let assetView = null;
+let assetViewAttached = false;
+// 面板页世代号：页面创建或重载时递增，用于识别 focus 推送落在过期文档上的情况。
+let assetViewGeneration = 0;
+let chromeOverlaysHidden = false;
+let platformBackdropSequence = 0;
+let platformBackdropPending = null;
+let platformBackdropDisplayedKey = '';
+// Frozen real frames live only for this modal; never written to disk.
+const platformBackdropSnapshots = new Map();
+let platformViewsRequestedHidden = false;
+let activeServiceId = null;
+let activeMode = initialBrowserSession?.activeMode || 'image';
+let activeTabId = null;
+// 双拼只活在这次运行里。退出、换模式或关标签都不写进 browser-session，也不重载网页。
+let splitViewSession = disableSplit();
+let splitFocusDepth = 0;
+let splitLayoutDepth = 0;
+let splitIgnoreFocusUntil = 0;
+let tabSequence = 0;
+let browserBounds = { x: 410, y: 112, width: 900, height: 700 };
+let assetPanelState = { open: false, layout: 'overlay', width: 520 };
+let downloadSequence = 0;
+
+// 多开标签：同一平台可以同时开多个网页（例如多个 GPT 窗口批量出图），
+// 会话分区仍按平台共享，保证同平台多窗口共用一次登录。
+const browserTabs = new Map();
+const lastModeTabs = { image: null, video: null };
+// 撤销关闭标签：用户逐个关闭的网页按时间入栈（最新在尾），Cmd/Ctrl+Shift+T 从尾恢复。
+const closedTabHistory = [];
+const downloadOwners = new WeakMap();
+const configuredSessions = new Set();
+const recentDownloads = [];
+const activeDownloadItems = new Map();
+let downloadReviewUI = null;
+let appQuitting = false;
+let recoveringVideoDownloads = false;
+const downloadEpisodeStore = createDownloadEpisodeStore({ filePath: path.join(process.env.VIDEO_OS_DATA_DIR, 'download-episodes.json') });
+function validateVideoDownloadTarget(entry, destination) {
+  const project = creativeProjectStore.get(entry.projectId);
+  if (!project?.available || !['editable', 'processing'].includes(entry.choice)) throw new Error('下载所属剧本目录不可用');
+  const base = creativeProjectStore.category(project.id, 'generated-videos').absolutePath;
+  const snapshot = entry.episodeSnapshot ? normalizeEpisodeSnapshot(entry.episodeSnapshot) : null;
+  if (snapshot && (snapshot.projectId !== entry.projectId || snapshot.serviceId !== entry.serviceId || snapshot.kind !== 'video')) {
+    throw new Error('视频下载分集快照无效');
+  }
+  const dispositionFolder = entry.choice === 'processing' ? '待处理' : '可剪辑';
+  const allowed = snapshot
+    ? path.join(base, currentEpisodePlatform(snapshot), episodeLabel(snapshot.episode), dispositionFolder)
+    : path.join(base, dispositionFolder);
+  const relative = path.relative(allowed, destination);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('下载归档路径越界');
+  for (let current = destination; current !== CREATIVE_ASSET_DIR; current = path.dirname(current)) {
+    if (fs.existsSync(current) && fs.lstatSync(current).isSymbolicLink()) throw new Error('下载归档路径不能包含符号链接');
+    if (current === path.dirname(current)) throw new Error('下载归档路径无效');
+  }
+}
+const videoDownloadReview = createDownloadReview({
+  dataDir: process.env.VIDEO_OS_DATA_DIR,
+  targetFor(entry) {
+    const project = creativeProjectStore.get(entry.projectId);
+    if (!project || !project.available) throw new Error('下载所属剧本目录不可用，视频仍保留在暂存区');
+    const category = creativeProjectStore.category(project.id, 'generated-videos');
+    const base = category.absolutePath;
+    if (!entry.episodeSnapshot && !/^\d{4}-\d{2}-\d{2}$/.test(entry.day || '')) throw new Error('旧视频下载日期记录无效，视频仍保留在暂存区');
+    const target = resolveDownloadTarget({
+      projectRoot: PROJECT_ROOT, serviceId: entry.serviceId, serviceLabel: entry.serviceLabel,
+      filename: entry.filename, mimeType: 'video/mp4', mode: 'video', videoDisposition: entry.choice,
+      projectDirectories: { video: base },
+      ...(entry.episodeSnapshot ? { episode: entry.episodeSnapshot.episode, platformFolder: currentEpisodePlatform(entry.episodeSnapshot) }
+        : { legacyDay: entry.day }),
+    });
+    validateVideoDownloadTarget(entry, target.targetPath);
+    fs.mkdirSync(target.directory, { recursive: true });
+    return sequentialImportTarget(target.directory, 'video', entry.filename, category.label);
+  },
+  validateTarget: validateVideoDownloadTarget,
+});
+let diagnosticLog = '';
+
+function initDiagnostics() {
+  try {
+    const dir = path.join(app.getPath('userData'), 'logs');
+    fs.mkdirSync(dir, { recursive: true });
+    diagnosticLog = path.join(dir, 'video-os.log');
+  } catch {}
+}
+
+function logDiagnostic(scope, detail) {
+  const message = detail instanceof Error ? (detail.stack || detail.message) : String(detail || '');
+  const line = `${new Date().toISOString()} [${scope}] ${message}\n`;
+  try { if (diagnosticLog) fs.appendFileSync(diagnosticLog, line, 'utf-8'); } catch {}
+  console.error(line.trim());
+}
+
+function isSafeWebUrl(value) {
+  return isSafeBrowserAddress(value);
+}
+
+function isLocalAppUrl(value) {
+  if (!localServerInfo) return false;
+  try {
+    return new URL(value).origin === new URL(localServerInfo.url).origin;
+  } catch {
+    return false;
+  }
+}
+
+function isTrustedMainSender(event) {
+  return workspaceSurface === 'main' && !!mainWindow && !mainWindow.isDestroyed() && event.sender === mainWindow.webContents;
+}
+
+function isTrustedCreatorSender(event) {
+  return workspaceSurface === 'creator' && !!creatorWindow && !creatorWindow.isDestroyed() && event.sender === creatorWindow.webContents;
+}
+
+function isTrustedAssetSender(event) {
+  return !!assetView && !assetView.webContents.isDestroyed() && event.sender === assetView.webContents;
+}
+
+// 单视频置顶浮窗：只认这一个浮窗自己的 webContents（无 parent、独立于工作区宿主窗口）。
+function isTrustedFloatVideoSender(event) {
+  return !!floatVideoWindow && !floatVideoWindow.isDestroyed() && event.sender === floatVideoWindow.webContents;
+}
+
+function isTrustedMediaSender(event) {
+  // 共享能力（原生拖拽等）：创作窗口 HTML 层和完整资产库。
+  return isTrustedCreatorSender(event) || isTrustedAssetSender(event);
+}
+
+function requireTrusted(event, kind) {
+  const trusted = kind === 'main'
+    ? isTrustedMainSender(event)
+    : kind === 'asset'
+      ? isTrustedAssetSender(event)
+      : kind === 'float'
+          ? isTrustedFloatVideoSender(event)
+          : kind === 'media'
+            ? isTrustedMediaSender(event)
+            : isTrustedCreatorSender(event);
+  if (!trusted) throw new Error('拒绝未经授权的桌面操作');
+}
+
+function modeOrDefault(value) {
+  return value === 'video' ? 'video' : 'image';
+}
+
+function customServices() {
+  return creatorPlatformStore.list();
+}
+
+function serviceById(serviceId) {
+  return SERVICES[serviceId] || customServices().find(service => service.id === serviceId) || null;
+}
+
+function modeServices(mode) {
+  const hiddenBuiltinIds = new Set(creatorPlatformStore.hiddenBuiltinIds());
+  const builtins = MODE_SERVICES[modeOrDefault(mode)].filter(serviceId => !hiddenBuiltinIds.has(serviceId));
+  return [...builtins, ...customServices().map(service => service.id)];
+}
+
+function validServiceForMode(mode, serviceId) {
+  return modeServices(mode).includes(serviceId);
+}
+
+function defaultServiceForMode(mode) {
+  const safeMode = modeOrDefault(mode);
+  const available = modeServices(safeMode);
+  return available.includes(MODE_DEFAULTS[safeMode]) ? MODE_DEFAULTS[safeMode] : (available[0] || null);
+}
+
+function publicDefaults() {
+  return { image: defaultServiceForMode('image'), video: defaultServiceForMode('video') };
+}
+
+function serviceUrl(serviceId) {
+  const service = serviceById(serviceId);
+  if (!service) throw new Error('未知创作平台');
+  if (!TEST_MODE) return service.url;
+  return `${localServerInfo.url}/creator-fixture.html?service=${encodeURIComponent(serviceId)}`;
+}
+
+function publicServices() {
+  const hiddenBuiltinIds = new Set(creatorPlatformStore.hiddenBuiltinIds());
+  const builtins = Object.values(SERVICES).map(({ id, label, imageLabel, videoLabel, url }) => ({
+    id, label, imageLabel, videoLabel, url, custom: false, hidden: hiddenBuiltinIds.has(id),
+  }));
+  return [...builtins, ...customServices()].map(service => ({
+    ...service, displayName: creatorPlatformStore.displayName(service.id),
+  }));
+}
+
+function publicModeServices() {
+  return { image: modeServices('image'), video: modeServices('video') };
+}
+
+function creatorPaths() {
+  const vault = OBSIDIAN_VAULT || '';
+  ensureCreativeAssetRoot(CREATIVE_ASSET_DIR);
+  const activeProject = creativeProjectStore?.active() || null;
+  const activeProjectRoot = activeProject ? creativeProjectStore.resolveRoot(activeProject.id) : CREATIVE_ASSET_DIR;
+  const category = categoryId => {
+    try { return activeProject ? creativeProjectStore.category(activeProject.id, categoryId).absolutePath : ''; }
+    catch { return ''; }
+  };
+  return {
+    projectRoot: PROJECT_ROOT,
+    activeProject,
+    activeProjectRoot,
+    materialRoot: category('generated-videos'),
+    audioRoot: category('audio'),
+    frameRoot: category('frames'),
+    creativeAssetRoot: activeProjectRoot,
+    creativeAssetLibraryRoot: CREATIVE_ASSET_DIR,
+    creativeAssetAvailable: true,
+    imageRoot: category('generated-images'),
+    downloadRoot: category('browser-downloads'),
+    legacyImageRoot: vault ? path.join(vault, 'ai创作短剧', '韩剧制作', '浏览器生成') : '',
+    obsidianAvailable: !!vault,
+    diagnosticLog,
+  };
+}
+
+function activeProjectDirectories() {
+  const paths = creatorPaths();
+  if (!paths.activeProject) throw new Error('请先选择一个剧本或灵感工作区');
+  return {
+    image: paths.imageRoot,
+    video: paths.materialRoot,
+    audio: paths.audioRoot,
+    downloads: paths.downloadRoot,
+  };
+}
+
+function directoriesForProject(project) {
+  if (!project?.available) throw new Error('下载所属剧本不可用');
+  const directory = categoryId => {
+    const category = project.categories?.find(item => item.id === categoryId);
+    return category?.available ? path.join(CREATIVE_ASSET_DIR, ...category.path.split('/')) : '';
+  };
+  return { image: directory('generated-images'), video: directory('generated-videos'),
+    audio: directory('audio'), downloads: directory('browser-downloads') };
+}
+
+const DOWNLOAD_EPISODE_CATEGORIES = Object.freeze({ image: 'generated-images', video: 'generated-videos', audio: 'audio' });
+
+function publicDownloadEpisodes(project = creativeProjectStore.active()) {
+  if (!project) return { projectId: '', states: [] };
+  const states = [];
+  for (const service of publicServices()) {
+    for (const kind of MEDIA_KINDS) {
+      const state = downloadEpisodeStore.get({ projectId: project.id, serviceId: service.id, kind, serviceLabel: service.label });
+      const category = project.categories?.find(item => item.id === DOWNLOAD_EPISODE_CATEGORIES[kind]);
+      const platformPath = category ? `${category.path}/${state.platformFolder}` : '';
+      states.push({ ...state, serviceLabel: service.label, label: episodeLabel(state.episode),
+        platformPath, episodePath: platformPath ? `${platformPath}/${episodeLabel(state.episode)}` : '',
+        available: !!(project.available && category?.available), legacy: false });
+    }
+  }
+  return { projectId: project.id, states };
+}
+
+function sendDownloadEpisodes(project = creativeProjectStore.active()) {
+  const state = publicDownloadEpisodes(project);
+  sendCreator('creator:download-episodes-changed', state);
+  if (assetView && !assetView.webContents.isDestroyed()) assetView.webContents.send('asset:download-episodes-changed', state);
+  return state;
+}
+
+function captureDownloadEpisode(serviceId, kind, projectId) {
+  if (!MEDIA_KINDS.has(kind)) return null;
+  const service = serviceById(serviceId);
+  if (!service) throw new Error('下载所属网站不存在');
+  return downloadEpisodeStore.capture({ projectId, serviceId, kind, serviceLabel: service.label });
+}
+
+function currentEpisodePlatform(snapshot) {
+  return snapshot ? downloadEpisodeStore.get(snapshot).platformFolder : '';
+}
+
+function relocateDownloadEpisodePlatform(oldPath, newPath) {
+  if (path.posix.dirname(oldPath) !== path.posix.dirname(newPath)) return;
+  const project = creativeProjectStore.list().find(item => oldPath.startsWith(`${item.folder}/`));
+  if (!project) return;
+  let changed = false;
+  for (const service of publicServices()) {
+    for (const kind of MEDIA_KINDS) {
+      const category = project.categories?.find(item => item.id === DOWNLOAD_EPISODE_CATEGORIES[kind]);
+      const state = downloadEpisodeStore.get({ projectId: project.id, serviceId: service.id, kind, serviceLabel: service.label });
+      if (category && oldPath === `${category.path}/${state.platformFolder}`) {
+        downloadEpisodeStore.renamePlatform(state, path.posix.basename(newPath));
+        changed = true;
+      }
+    }
+  }
+  if (changed && project.id === creativeProjectStore.active()?.id) sendDownloadEpisodes(creativeProjectStore.get(project.id));
+}
+
+function captureArchiveContext(serviceId, mode, kind, project = creativeProjectStore.active()) {
+  const service = serviceById(serviceId);
+  if (!service || !project?.available) throw new Error('下载所属剧本或网站不可用');
+  const projectDirectories = directoriesForProject(project);
+  const episodeSnapshot = captureDownloadEpisode(serviceId, kind, project.id);
+  return { projectDirectories, episodeSnapshot, serviceLabel: service.label,
+    categoryLabel: project.categories?.find(item => item.id === DOWNLOAD_EPISODE_CATEGORIES[kind])?.label || '',
+    productionSnapshot: captureProductionContext(serviceId, mode, project) };
+}
+
+function episodeTargetOptions(snapshot) {
+  return snapshot ? { episode: snapshot.episode, platformFolder: snapshot.platformFolder } : {};
+}
+
+function validateArchiveDirectory(categoryRoot, directory) {
+  if (!path.isAbsolute(categoryRoot || '') || !path.isAbsolute(directory || '')) throw new Error('下载归档目录未连接');
+  const categoryRelative = path.relative(CREATIVE_ASSET_DIR, categoryRoot).split(path.sep).join('/');
+  if (!resolveCreativeAsset(CREATIVE_ASSET_DIR, categoryRelative, 'folder')) throw new Error('下载所属剧本分类不可用');
+  const relative = path.relative(categoryRoot, directory);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('下载归档目录越界');
+  for (let current = directory; current !== categoryRoot; current = path.dirname(current)) {
+    if (fs.existsSync(current)) {
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('下载归档目录无效或包含符号链接');
+    }
+  }
+}
+
+function ensureArchiveDirectory(categoryRoot, directory) {
+  validateArchiveDirectory(categoryRoot, directory);
+  fs.mkdirSync(directory, { recursive: true });
+}
+
+function publicAssetPanelState() {
+  return {
+    open: !!assetPanelState.open,
+    layout: assetPanelState.layout === 'push' ? 'push' : 'overlay',
+    width: assetPanelState.width,
+    creativeAssetAvailable: true,
+    obsidianAvailable: !!OBSIDIAN_VAULT,
+  };
+}
+
+function normalizeAssetPanelState(patch = {}) {
+  const requestedWidth = Number(patch.width);
+  const width = Number.isFinite(requestedWidth)
+    ? Math.max(ASSET_PANEL_MIN_WIDTH, Math.min(ASSET_PANEL_MAX_WIDTH, Math.round(requestedWidth)))
+    : assetPanelState.width;
+  return {
+    open: patch.open === undefined ? assetPanelState.open : !!patch.open,
+    layout: patch.layout === undefined
+      ? assetPanelState.layout
+      : patch.layout === 'push' ? 'push' : 'overlay',
+    width,
+  };
+}
+
+function sendAssetPanelState() {
+  const panel = publicAssetPanelState();
+  sendCreator('creator:asset-panel-state', panel);
+  if (assetView && !assetView.webContents.isDestroyed()) assetView.webContents.send('asset:panel-state', panel);
+  return panel;
+}
+
+function sendCreator(channel, payload) {
+  if (workspaceSurface === 'creator' && creatorWindow && !creatorWindow.isDestroyed()) creatorWindow.webContents.send(channel, payload);
+}
+
+function sendMain(channel, payload) {
+  if (workspaceSurface === 'main' && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+}
+
+function safeServiceUrl(serviceId) {
+  try { return serviceUrl(serviceId); } catch { return ''; }
+}
+
+function tabById(tabId) {
+  return browserTabs.get(String(tabId || '')) || null;
+}
+
+function serviceTabLabel(tab) {
+  const service = serviceById(tab.serviceId);
+  return tab.customName || tab.displayLabel || creatorPlatformStore.displayName(tab.serviceId) || service?.label || '创作网页';
+}
+
+function publicTabs() {
+  return [...browserTabs.values()].map(tab => ({
+    id: tab.id,
+    serviceId: tab.serviceId,
+    label: serviceTabLabel(tab),
+    customName: tab.customName || '',
+    url: tab.currentUrl || safeServiceUrl(tab.serviceId),
+    mode: tab.mode,
+    active: tab.id === activeTabId,
+    pinned: !!tab.pinned,
+    audible: !!tab.audible,
+    muted: !!(tab.view && !tab.view.webContents.isDestroyed()
+      && typeof tab.view.webContents.isAudioMuted === 'function'
+      && tab.view.webContents.isAudioMuted()),
+  }));
+}
+
+function browserState() {
+  const split = (typeof splitViewSession === 'undefined' || typeof publicSplit !== 'function')
+    ? { enabled: false, leftTabId: null, rightTabId: null, focusedPane: 'left', ratio: 0.5, gutter: 4 }
+    : publicSplit(splitViewSession);
+  const tab = tabById(activeTabId);
+  if (!tab || tab.view.webContents.isDestroyed()) {
+    const service = serviceById(activeServiceId);
+    return {
+      mode: activeMode,
+      tabId: activeTabId,
+      serviceId: activeServiceId,
+      displayLabel: service?.label || '',
+      loading: false, url: '', title: '',
+      canGoBack: false, canGoForward: false, error: '',
+      loadTimedOut: false, loginRejected: false,
+      tabs: publicTabs(),
+      split,
+    };
+  }
+  const contents = tab.view.webContents;
+  return {
+    mode: tab.mode,
+    tabId: tab.id,
+    serviceId: tab.serviceId,
+    displayLabel: serviceTabLabel(tab),
+    loading: contents.isLoading(),
+    url: tab.currentUrl || contents.getURL() || safeServiceUrl(tab.serviceId),
+    title: contents.getTitle(),
+    canGoBack: contents.navigationHistory.canGoBack(),
+    canGoForward: contents.navigationHistory.canGoForward(),
+    error: tab.error || '',
+    loadTimedOut: !!tab.loadTimedOut,
+    loginRejected: !!tab.loginRejected,
+    tabs: publicTabs(),
+    split,
+  };
+}
+
+function updateTabDisplayLabel(tab, value) {
+  if (TEST_MODE) return;
+  try {
+    const service = serviceById(tab.serviceId);
+    if (!service) return;
+    const currentHost = new URL(value).hostname.replace(/^www\./i, '');
+    const homeHost = new URL(service.url).hostname.replace(/^www\./i, '');
+    if (currentHost && currentHost !== homeHost) tab.displayLabel = currentHost;
+    else tab.displayLabel = '';
+  } catch {
+    tab.displayLabel = '';
+  }
+}
+
+function pushBrowserState() {
+  persistBrowserSession();
+  sendCreator('creator:browser-state', browserState());
+}
+
+function persistBrowserSession() {
+  if (restoringBrowserSession || closingWorkspace || !browserSessionRestored) return;
+  const snapshot = {
+    schemaVersion: 1,
+    activeMode,
+    lastModeTabs: { ...lastModeTabs },
+    initializedModes: { ...initializedModes },
+    tabs: [...browserTabs.values()].map(tab => ({
+      id: tab.id, serviceId: tab.serviceId, mode: tab.mode,
+      url: tab.currentUrl || safeServiceUrl(tab.serviceId), customName: tab.customName || '',
+      pinned: !!tab.pinned,
+    })),
+  };
+  const serialized = JSON.stringify(snapshot);
+  if (serialized === lastBrowserSnapshot) return;
+  try { browserSessionStore.save(snapshot); lastBrowserSnapshot = serialized; }
+  catch (error) { logDiagnostic('browser-session-save', error); }
+}
+
+function restoreBrowserSession() {
+  if (browserSessionRestored) return;
+  const saved = browserSessionStore.load();
+  restoringBrowserSession = true;
+  try {
+    if (saved) {
+      initializedModes = { ...saved.initializedModes };
+      activeMode = saved.activeMode;
+      for (const item of saved.tabs) {
+        if (!validServiceForMode(item.mode, item.serviceId)) continue;
+        createTab(item.serviceId, item.mode, {
+          activate: false, id: item.id, initialUrl: item.url, customName: item.customName, deferLoad: true,
+          pinned: !!item.pinned,
+        });
+      }
+      for (const mode of ['image', 'video']) {
+        const previous = tabById(saved.lastModeTabs[mode]);
+        lastModeTabs[mode] = previous?.mode === mode ? previous.id
+          : [...browserTabs.values()].find(tab => tab.mode === mode)?.id || null;
+      }
+      if (lastModeTabs[activeMode]) activateTab(lastModeTabs[activeMode]);
+    }
+  } finally {
+    restoringBrowserSession = false;
+    browserSessionRestored = true;
+  }
+}
+
+function showEmptyBrowserMode(mode) {
+  if (typeof splitViewSession !== 'undefined' && splitViewSession && splitViewSession.enabled && typeof disableSplit === 'function') {
+    splitViewSession = disableSplit(splitViewSession);
+  }
+  if (activeView) {
+    try { creatorWindow?.contentView.removeChildView(activeView); } catch {}
+  }
+  activeMode = modeOrDefault(mode);
+  activeView = null;
+  activeTabId = null;
+  activeServiceId = null;
+  lastModeTabs[activeMode] = null;
+  if (platformViewsRequestedHidden) {
+    chromeOverlaysHidden = true;
+    setPlatformViewHidden(true, true).catch(error => logDiagnostic('platform-backdrop', error));
+  }
+  applyCreatorLayout();
+  pushBrowserState();
+  return browserState();
+}
+
+async function confirmClearBrowserTabs() {
+  const win = creatorWindow;
+  const cancelled = () => ({ ...browserState(), clearCancelled: true });
+  if (!browserTabs.size || !win || win.isDestroyed()) return cancelled();
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'question',
+    title: '确认清空网页',
+    message: '确定清空全部网页吗？',
+    detail: '将关闭图片模式和视频模式的全部标签，网页中未提交的内容可能丢失。网站登录、剧本和素材会保留。',
+    buttons: ['取消', '清空网页'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  if (response !== 1 || win.isDestroyed()) return cancelled();
+  return clearBrowserTabs();
+}
+
+function clearBrowserTabs() {
+  if ([...activeDownloadItems.values()].some(item => ['progressing', 'paused'].includes(item.record?.state))) {
+    throw new Error('还有下载任务，请完成或取消下载后再清空网页');
+  }
+  const emptySnapshot = {
+    schemaVersion: 1, activeMode, tabs: [],
+    lastModeTabs: { image: null, video: null },
+    initializedModes: { image: true, video: true },
+  };
+  // 先落盘，再关闭网页；写入失败时保留所有标签，并把错误交给界面。
+  browserSessionStore.save(emptySnapshot);
+  lastBrowserSnapshot = JSON.stringify(emptySnapshot);
+  initializedModes = { image: true, video: true };
+  restoringBrowserSession = true;
+  try { for (const tab of [...browserTabs.values()]) destroyTab(tab); }
+  finally { restoringBrowserSession = false; }
+  return showEmptyBrowserMode(activeMode);
+}
+
+// 标签拖拽换位：{ swapTabId, withTabId } 互换两个标签的位置；
+// { moveTabId, beforeTabId } 把标签移动到 beforeTabId 之前（beforeTabId 为空＝移到末尾）。
+// 只调整 browserTabs 的键顺序，不触碰视图、激活状态与登录；pushBrowserState 负责广播和持久化新顺序。
+function reorderBrowserTabs(payload = {}) {
+  const swapTabId = String(payload.swapTabId || '');
+  const withTabId = String(payload.withTabId || '');
+  const moveTabId = String(payload.moveTabId || '');
+  const beforeTabId = String(payload.beforeTabId || '');
+  const reordered = new Map();
+  if (swapTabId && withTabId) {
+    const first = tabById(swapTabId);
+    const second = tabById(withTabId);
+    if (!first || !second) throw new Error('这个网页已关闭');
+    // 标签顺序由 Map 的键插入顺序决定：互换＝在各自位置放入对方的键和值（键与 tab.id 必须保持一致）
+    if (first.id !== second.id) {
+      for (const [id, tab] of browserTabs) {
+        if (id === first.id) reordered.set(second.id, second);
+        else if (id === second.id) reordered.set(first.id, first);
+        else reordered.set(id, tab);
+      }
+    }
+  } else if (moveTabId) {
+    const moving = tabById(moveTabId);
+    if (!moving) throw new Error('这个网页已关闭');
+    const anchor = beforeTabId ? tabById(beforeTabId) : null;
+    if (beforeTabId && !anchor) throw new Error('目标网页已关闭');
+    if (!anchor) {
+      for (const [id, tab] of browserTabs) if (id !== moving.id) reordered.set(id, tab);
+      reordered.set(moving.id, moving);
+    } else if (anchor.id !== moving.id) {
+      // anchor === moving ＝拖回自己原来的位置，保持顺序不变
+      for (const [id, tab] of browserTabs) {
+        if (id === moving.id) continue;
+        if (id === anchor.id) reordered.set(moving.id, moving);
+        reordered.set(id, tab);
+      }
+      if (!reordered.has(moving.id)) reordered.set(moving.id, moving);
+    }
+  } else {
+    throw new Error('缺少要移动的网页');
+  }
+  if (reordered.size && [...browserTabs.keys()].join('\n') !== [...reordered.keys()].join('\n')) {
+    // 未固定标签拖到固定标签前面时，钳制回固定组之后，保持“固定组永远在最前”的不变量
+    stabilizePinnedTabsOrder(reordered);
+    browserTabs.clear();
+    for (const [id, tab] of reordered) browserTabs.set(id, tab);
+  }
+  pushBrowserState();
+  return browserState();
+}
+
+// —— 浏览器级标签操作（对标 Chrome 的循环切换 / 撤销关闭 / 固定标签 / 静音 / 关闭其他）——
+
+// 把固定标签稳定排在最前：任何重排之后跑一遍稳定分区，保持两组内部相对顺序不变。
+function stabilizePinnedTabsOrder(map) {
+  const list = [...map.entries()];
+  map.clear();
+  for (const [id, item] of list) if (item.pinned) map.set(id, item);
+  for (const [id, item] of list) if (!item.pinned) map.set(id, item);
+}
+
+function cycleBrowserTab(offset) {
+  const ids = [...browserTabs.values()]
+    .filter(tab => tab.mode === activeMode && validServiceForMode(activeMode, tab.serviceId))
+    .map(tab => tab.id);
+  if (ids.length < 2) return browserState();
+  const index = ids.indexOf(activeTabId);
+  const nextId = ids[index === -1 ? 0 : (index + offset + ids.length) % ids.length];
+  return activateTab(nextId);
+}
+
+function restoreClosedTab() {
+  // 只恢复当前创作模式的标签：跨模式恢复会把主进程切到另一个模式，
+  // 渲染端 applyBrowserState 会因模式不一致而忽略推送，界面就不同步了。
+  // 其他模式的关闭记录留在栈里，用户切回该模式仍可恢复。
+  const index = [...closedTabHistory].reverse()
+    .findIndex(entry => entry.mode === activeMode && validServiceForMode(entry.mode, entry.serviceId));
+  if (index === -1) {
+    sendCreator('creator:notice', '当前模式下没有可以恢复的已关闭网页');
+    return browserState();
+  }
+  const entry = closedTabHistory.splice(closedTabHistory.length - 1 - index, 1)[0];
+  const anchorId = activeTabId;
+  const tab = createTab(entry.serviceId, entry.mode, {
+    activate: true, initialUrl: entry.url, customName: entry.customName, pinned: !!entry.pinned,
+  });
+  // 恢复的标签插回关闭前的活动位置旁边（对标 Chrome 的 Ctrl+Shift+T）
+  if (anchorId && anchorId !== tab.id && browserTabs.has(anchorId)) {
+    const remaining = [...browserTabs.entries()].filter(([tabId]) => tabId !== tab.id);
+    browserTabs.clear();
+    let inserted = false;
+    for (const [tabId, item] of remaining) {
+      browserTabs.set(tabId, item);
+      if (!inserted && tabId === anchorId) { browserTabs.set(tab.id, tab); inserted = true; }
+    }
+    if (!inserted) browserTabs.set(tab.id, tab);
+  }
+  stabilizePinnedTabsOrder(browserTabs);
+  pushBrowserState();
+  sendCreator('creator:notice', `已重新打开「${serviceTabLabel(tab)}」`);
+  return browserState();
+}
+
+function setTabPinned(tabId, pinned) {
+  const tab = tabById(tabId);
+  if (!tab) throw new Error('这个网页已关闭');
+  tab.pinned = !!pinned;
+  stabilizePinnedTabsOrder(browserTabs);
+  pushBrowserState();
+  return browserState();
+}
+
+function setTabMuted(tabId, muted) {
+  const tab = tabById(tabId);
+  if (!tab) throw new Error('这个网页已关闭');
+  if (!tab.view.webContents.isDestroyed()) tab.view.webContents.setAudioMuted(!!muted);
+  pushBrowserState();
+  return browserState();
+}
+
+// 关闭其他 / 左侧 / 右侧：只作用于同一创作模式的标签，
+// 有进行中下载的平台先跳过，避免打断下载；活动标签被关掉时回到锚点标签。
+function closeOtherTabs(anchorId, scope) {
+  const anchor = tabById(anchorId);
+  if (!anchor) throw new Error('这个网页已关闭');
+  const ids = [...browserTabs.values()].filter(tab => tab.mode === anchor.mode).map(tab => tab.id);
+  const targets = scope === 'right'
+    ? ids.slice(ids.indexOf(anchor.id) + 1)
+    : scope === 'left' ? ids.slice(0, ids.indexOf(anchor.id)) : ids.filter(id => id !== anchor.id);
+  const downloading = new Set([...activeDownloadItems.values()]
+    .filter(transfer => ['progressing', 'paused'].includes(transfer.record?.state))
+    .map(transfer => transfer.record?.serviceId).filter(Boolean));
+  let closed = 0;
+  for (const id of targets.reverse()) {
+    const tab = tabById(id);
+    if (!tab || downloading.has(tab.serviceId)) continue;
+    closedTabHistory.push({ serviceId: tab.serviceId, mode: tab.mode, url: tab.currentUrl, customName: tab.customName, pinned: !!tab.pinned });
+    if (closedTabHistory.length > 10) closedTabHistory.shift();
+    destroyTab(tab);
+    closed++;
+  }
+  if (!tabById(activeTabId)) activateTab(anchor.id);
+  else pushBrowserState();
+  return { ...browserState(), closed };
+}
+
+function publicDownload(record) {
+  return {
+    id: record.id,
+    serviceId: record.serviceId,
+    serviceLabel: record.serviceLabel,
+    mode: record.mode,
+    kind: record.kind,
+    filename: record.filename,
+    savePath: record.pendingReview ? '' : record.savePath,
+    pendingReview: !!record.pendingReview,
+    videoDisposition: record.videoDisposition || '',
+    state: record.state,
+    receivedBytes: record.receivedBytes,
+    totalBytes: record.totalBytes,
+    startedAt: record.startedAt,
+    endedAt: record.endedAt || null,
+    error: record.error || '',
+    source: record.source || 'platform',
+    shotId: record.productionSnapshot && record.productionSnapshot.shotId || null,
+    shotNo: record.productionSnapshot && record.productionSnapshot.shotNo || '',
+    shotTitle: record.productionSnapshot && record.productionSnapshot.shotTitle || '',
+    contextRevision: Number(record.productionSnapshot && record.productionSnapshot.contextRevision || 0),
+    projectId: record.productionSnapshot && record.productionSnapshot.projectId || '',
+    episode: record.episodeSnapshot?.episode || null,
+    episodeLabel: record.episodeSnapshot ? episodeLabel(record.episodeSnapshot.episode) : '',
+    platformFolder: record.episodeSnapshot?.platformFolder || '',
+    inboxId: record.inboxId || null,
+    ingestState: record.ingestState || (record.state === 'completed' ? 'pending' : ''),
+    ingestError: record.ingestError || '',
+  };
+}
+
+function captureProductionContext(serviceId, mode, project = creativeProjectStore?.active()) {
+  // 新结果只归属剧本，不再继承旧版本中可能残留的当前镜头。
+  const projectId = project?.id || '';
+  return { shotId: null, shotNo: '', shotTitle: '', contextRevision: 0, projectId, serviceId, mode };
+}
+
+function archiveDownloadInProduction(record) {
+  if (!productionStore || record.state !== 'completed') return;
+  try {
+    const item = productionStore.recordDownload({
+      downloadKey: record.id,
+      assetPath: record.savePath,
+      filename: record.filename,
+      kind: record.kind,
+      mode: record.mode,
+      serviceId: record.serviceId,
+      serviceLabel: record.serviceLabel,
+      source: record.source || 'platform',
+      sizeBytes: record.totalBytes || record.receivedBytes || 0,
+    }, record.productionSnapshot || {});
+    record.inboxId = item.id;
+    record.ingestState = item.state;
+    record.ingestError = item.error || '';
+    if (typeof serverModule.broadcastProduction === 'function') serverModule.broadcastProduction();
+  } catch (error) {
+    record.ingestState = 'error';
+    record.ingestError = `文件已归档，但制作台账写入失败：${error.message}`;
+    appendLog(record.ingestError);
+  }
+}
+
+function broadcastDownload(record) {
+  sendCreator('creator:download', publicDownload(record));
+}
+
+function chooseVideoDownload(record) {
+  if (!downloadReviewUI || appQuitting) return Promise.resolve('defer');
+  return downloadReviewUI.choose({ ...record, projectName: creativeProjectStore.get(record.productionSnapshot?.projectId)?.name || '原剧本' })
+    .then(choice => {
+      if (['editable', 'processing'].includes(choice)) {
+        videoDownloadReview.choose(record.id, choice);
+        record.videoDisposition = choice;
+        broadcastDownload(record);
+      }
+      return choice;
+    });
+}
+
+async function finishReviewedVideo(record) {
+  const result = await videoDownloadReview.finalize(record.id);
+  record.savePath = result.path;
+  record.filename = path.basename(result.path);
+  record.videoDisposition = result.choice;
+  record.pendingReview = false;
+  record.state = 'completed';
+  activeDownloadItems.delete(record.id);
+  if (!appQuitting) {
+    archiveDownloadInProduction(record);
+    serverModule.recordAssetWorkflow(record.productionSnapshot?.projectId, record.savePath, { videoDisposition: result.choice });
+    broadcastDownload(record);
+    serverModule.broadcastCreativeAssets?.();
+    sendMain('os:download-complete', publicDownload(record));
+  }
+}
+
+async function recoverVideoDownloads() {
+  if (recoveringVideoDownloads || appQuitting || !downloadReviewUI) return;
+  recoveringVideoDownloads = true;
+  try {
+    for (const entry of videoDownloadReview.list()) {
+      if (activeDownloadItems.has(entry.id) || appQuitting) continue;
+      if (!entry.completed) {
+        // 退出时被中断的网络下载不能被当作完整视频。只清自己的暂存文件。
+        await videoDownloadReview.discard(entry.id);
+        sendCreator('creator:notice', '上次有视频下载未完成，请返回平台重新下载。');
+        continue;
+      }
+      const record = { ...entry, kind: 'video', mode: 'video', savePath: entry.stagePath,
+        pendingReview: true, state: 'paused', productionSnapshot: entry.productionSnapshot || { projectId: entry.projectId },
+        totalBytes: entry.size || 0, receivedBytes: entry.size || 0 };
+      recentDownloads.unshift(record);
+      activeDownloadItems.set(record.id, { item: null, record });
+      const choice = entry.choice || await chooseVideoDownload(record);
+      if (appQuitting || choice === 'defer') break;
+      if (choice === 'cancel') {
+        await videoDownloadReview.discard(record.id);
+        record.state = 'cancelled'; record.error = '下载已取消'; activeDownloadItems.delete(record.id);
+        broadcastDownload(record);
+      } else {
+        try { await finishReviewedVideo(record); }
+        catch (error) { record.error = `视频仍在暂存区：${error.message}`; broadcastDownload(record); }
+      }
+    }
+  } catch (error) { logDiagnostic('video-download-recovery', error); }
+  finally { recoveringVideoDownloads = false; }
+}
+
+function configureSession(serviceId, ses) {
+  if (configuredSessions.has(serviceId)) return;
+  configuredSessions.add(serviceId);
+
+  // 标准 Chrome 级权限：AI 站点常见的剪贴板、麦克风/摄像头、通知、存储等直接放行，
+  // 避免登录/使用过程中被静默拒绝导致页面功能异常或反复验证。
+  const allowedPermissions = new Set([
+    'clipboard-sanitized-write', 'clipboard-read', 'fullscreen',
+    'media', 'audioCapture', 'videoCapture', 'display-capture',
+    'notifications', 'pointerLock', 'persistent-storage', 'geolocation',
+    'storage-access', 'top-level-storage-access', 'midi', 'midiSysex',
+  ]);
+  const allowPermission = permission => allowedPermissions.has(permission);
+  ses.setUserAgent(CREATOR_BROWSER_UA);
+  // Client-Hints 头一致性：UA 伪装成 Chrome 后，Sec-CH-UA 系列请求头若仍是 Chromium，
+  // Google 服务端会因“UA 与 Client-Hints 矛盾”直接拒绝登录（signin/rejected）。
+  const chromeMajor = String(process.versions.chrome).split('.')[0];
+  const secChUA = `"Chromium";v="${chromeMajor}", "Google Chrome";v="${chromeMajor}", ";Not A Brand";v="99"`;
+  const secChUAFull = `"Chromium";v="${chromeMajor}.0.0.0", "Google Chrome";v="${chromeMajor}.0.0.0", ";Not A Brand";v="99.0.0.0"`;
+  const secChUAPlatform = process.platform === 'darwin' ? '"macOS"' : '"Windows"';
+  // 注意：必须使用 callback 异步形式；同步返回形式在当前 Electron 版本会挂起请求。
+  ses.webRequest.onBeforeSendHeaders((details, callback) => {
+    const headers = { ...details.requestHeaders };
+    for (const key of Object.keys(headers)) {
+      const lower = key.toLowerCase();
+      if (lower === 'sec-ch-ua') headers[key] = secChUA;
+      else if (lower === 'sec-ch-ua-full-version-list') headers[key] = secChUAFull;
+      else if (lower === 'sec-ch-ua-mobile') headers[key] = '?0';
+      else if (lower === 'sec-ch-ua-platform') headers[key] = secChUAPlatform;
+    }
+    callback({ requestHeaders: headers });
+  });
+  // 页面环境补丁：让 Google 登录等站点把内嵌浏览器当作标准 Chrome（plugins/chrome/webdriver 指纹）。
+  const pagePatchPreload = path.join(__dirname, 'creator-page-patch-preload.cjs');
+  try {
+    if (typeof ses.registerPreloadScript === 'function') {
+      ses.registerPreloadScript({ id: `vos-page-patch-${serviceId}`, type: 'frame', filePath: pagePatchPreload });
+    } else {
+      ses.setPreloads([pagePatchPreload]);
+    }
+  } catch (error) {
+    logDiagnostic(`creator-page-patch:${serviceId}`, error.message || String(error));
+  }
+  // 网页在项目来源等流程中可能异步保留拖入的 FileSystemFileHandle。
+  // 仅旧白名单会把后续 readable 检查一律拒绝，导致 getFile() 抛 NotAllowedError；普通
+  // input[type=file] 不走该权限，因而看起来只有拖入失败。
+  const fileReadPolicy = serviceId === 'gpt' ? createCreatorFileReadPolicy(ses) : null;
+  const allowFileRead = (contents, origin, details) => fileReadPolicy?.allows(contents, origin, details) === true;
+  ses.setPermissionCheckHandler((contents, permission, requestingOrigin, details = {}) => {
+    if (permission !== 'fileSystem') return allowPermission(permission);
+    const allowed = allowFileRead(contents, requestingOrigin, details);
+    if (!allowed && serviceId === 'gpt') logDiagnostic('creator-file-read:gpt', JSON.stringify({
+      phase: 'check', access: ['readable', 'writable'].includes(details.fileAccessType) ? details.fileAccessType : 'unknown', allowed: false,
+    }));
+    return allowed;
+  });
+  ses.setPermissionRequestHandler((contents, permission, callback, details = {}) => {
+    if (permission !== 'fileSystem') { callback(allowPermission(permission)); return; }
+    const allowed = allowFileRead(contents, details.requestingUrl, details);
+    if (!allowed && serviceId === 'gpt') logDiagnostic('creator-file-read:gpt', JSON.stringify({
+      phase: 'request', access: ['readable', 'writable'].includes(details.fileAccessType) ? details.fileAccessType : 'unknown', allowed: false,
+    }));
+    callback(allowed);
+  });
+  if (serviceId === 'gpt') observeCreatorUploadFailures(ses, failure => {
+    logDiagnostic('creator-upload:gpt', JSON.stringify(failure));
+  });
+
+  ses.on('will-download', (event, item, sourceContents) => {
+    const service = serviceById(serviceId);
+    if (!service) { event.preventDefault(); return; }
+    const downloadingTab = sourceContents ? downloadOwners.get(sourceContents) : tabById(activeTabId);
+    const displayLabel = downloadingTab && downloadingTab.serviceId === serviceId
+      ? serviceTabLabel(downloadingTab)
+      : service.label;
+    const mode = downloadingTab?.mode || activeMode;
+    const originalName = item.getFilename() || `download-${Date.now()}`;
+    const kind = classifyDownload({ filename: originalName, mimeType: item.getMimeType(), mode, serviceId });
+    const id = `dl-${Date.now()}-${++downloadSequence}`;
+    const startedAt = new Date().toISOString();
+    let target;
+    let savePath;
+    let archiveContext;
+    try {
+      archiveContext = captureArchiveContext(serviceId, mode, kind);
+      target = resolveDownloadTarget({
+        projectRoot: PROJECT_ROOT,
+        obsidianVault: OBSIDIAN_VAULT,
+        serviceId,
+        serviceLabel: archiveContext.serviceLabel,
+        mode,
+        filename: originalName,
+        mimeType: item.getMimeType(),
+        projectDirectories: archiveContext.projectDirectories,
+        ...episodeTargetOptions(archiveContext.episodeSnapshot),
+        exists: candidate => fs.existsSync(candidate) || [...activeDownloadItems.values()].some(transfer => transfer.record.savePath === candidate),
+      });
+      if (target.kind === 'video') {
+        const staged = videoDownloadReview.begin({ id, projectId: archiveContext.productionSnapshot.projectId, serviceId,
+          serviceLabel: archiveContext.serviceLabel, filename: originalName, startedAt,
+          episodeSnapshot: archiveContext.episodeSnapshot, productionSnapshot: archiveContext.productionSnapshot });
+        savePath = staged.stagePath;
+      } else {
+        ensureArchiveDirectory(archiveContext.projectDirectories[target.kind === 'file' ? 'downloads' : target.kind], target.directory);
+        savePath = target.kind === 'image' ? sequentialImportTarget(target.directory, target.kind, originalName, archiveContext.categoryLabel) : target.targetPath;
+      }
+      item.setSavePath(savePath);
+    } catch (error) {
+      event.preventDefault();
+      const failedRecord = {
+        id,
+        serviceId,
+        serviceLabel: displayLabel,
+        mode,
+        kind: 'other',
+        filename: originalName,
+        savePath: '',
+        state: 'interrupted',
+        receivedBytes: 0,
+        totalBytes: Math.max(0, item.getTotalBytes()),
+        startedAt: new Date().toISOString(),
+        endedAt: new Date().toISOString(),
+        error: `无法保存下载：${error.message}`,
+      };
+      recentDownloads.unshift(failedRecord);
+      if (recentDownloads.length > 50) recentDownloads.length = 50;
+      broadcastDownload(failedRecord);
+      return;
+    }
+
+    const record = {
+      id,
+      serviceId,
+      serviceLabel: displayLabel,
+      mode,
+      kind: target.kind,
+      filename: path.basename(savePath),
+      savePath,
+      state: 'progressing',
+      receivedBytes: 0,
+      totalBytes: Math.max(0, item.getTotalBytes()),
+      startedAt,
+      productionSnapshot: archiveContext.productionSnapshot,
+      episodeSnapshot: archiveContext.episodeSnapshot,
+      pendingReview: target.kind === 'video',
+    };
+    recentDownloads.unshift(record);
+    if (recentDownloads.length > 50) recentDownloads.length = 50;
+    activeDownloadItems.set(id, { item, record, finished: false });
+    broadcastDownload(record);
+    const classification = target.kind === 'video' ? chooseVideoDownload(record) : null;
+    if (classification) classification.then(choice => {
+      const transfer = activeDownloadItems.get(id);
+      if (choice === 'cancel' && transfer?.item === item && !transfer.finished) item.cancel();
+    }).catch(error => { record.error = `视频分类失败：${error.message}`; broadcastDownload(record); });
+
+    item.on('updated', (_downloadEvent, state) => {
+      record.state = state === 'interrupted' ? 'interrupted' : (item.isPaused() ? 'paused' : 'progressing');
+      record.receivedBytes = Math.max(0, item.getReceivedBytes());
+      record.totalBytes = Math.max(0, item.getTotalBytes());
+      broadcastDownload(record);
+    });
+
+    item.once('done', async (_downloadEvent, state) => {
+      const transfer = activeDownloadItems.get(id);
+      if (transfer) transfer.finished = true;
+      record.state = state === 'completed' && record.pendingReview ? 'paused' : state;
+      record.receivedBytes = Math.max(0, item.getReceivedBytes());
+      record.totalBytes = Math.max(0, item.getTotalBytes());
+      record.endedAt = new Date().toISOString();
+      if (state !== 'completed') record.error = state === 'cancelled' ? '下载已取消' : '下载中断，可返回平台重试';
+      if (record.pendingReview) {
+        try {
+          if (state === 'completed') videoDownloadReview.complete(id);
+          else downloadReviewUI?.cancel(id);
+          const choice = await classification;
+          if (appQuitting || choice === 'defer') return;
+          if (state !== 'completed' || choice === 'cancel') {
+            await videoDownloadReview.discard(id);
+            activeDownloadItems.delete(id);
+            record.pendingReview = false; record.savePath = '';
+            if (choice === 'cancel') { record.state = 'cancelled'; record.error = '下载已取消'; }
+            broadcastDownload(record);
+          } else await finishReviewedVideo(record);
+        } catch (error) {
+          record.state = 'paused'; record.error = `视频仍保留在暂存区：${error.message}`;
+          broadcastDownload(record);
+          sendCreator('creator:notice', record.error);
+          logDiagnostic('video-download-finalize', error);
+        }
+        return;
+      }
+      activeDownloadItems.delete(id);
+      if (state === 'completed') archiveDownloadInProduction(record);
+      broadcastDownload(record);
+      if (state === 'completed') {
+        sendMain('os:download-complete', publicDownload(record));
+      }
+    });
+  });
+}
+
+async function copyFileWithProgress(sourcePath, targetPath, onProgress) {
+  const stat = await fs.promises.stat(sourcePath);
+  if (!stat.isFile()) throw new Error('选择的路径不是文件');
+  let copied = 0;
+  let lastUpdate = 0;
+  // 先独占创建；同名冲突发生在清理范围之外，绝不能删掉另一份已存在的文件。
+  const handle = await fs.promises.open(targetPath, 'wx');
+  try {
+    const input = fs.createReadStream(sourcePath);
+    const output = handle.createWriteStream();
+    input.on('data', chunk => {
+      copied += chunk.length;
+      const now = Date.now();
+      if (now - lastUpdate >= 120 || copied === stat.size) {
+        lastUpdate = now;
+        onProgress(copied, stat.size);
+      }
+    });
+    await pipeline(input, output);
+    return stat.size;
+  } catch (error) {
+    await handle.close().catch(() => {});
+    try { await fs.promises.unlink(targetPath); } catch {}
+    throw error;
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+// 拖入资产按“类别名+序号”自动命名；本地选文件保留原名，不消耗自动命名序号。
+const { nextSequentialImportName } = require('./import-names.cjs');
+
+function sequentialImportTarget(directory, kind, originalName, categoryLabel) {
+  const categoryId = { image: 'generated-images', video: 'generated-videos', audio: 'audio' }[kind];
+  const label = categoryLabel || (categoryId && creativeProjectStore.category(creativeProjectStore.active().id, categoryId).label);
+  const extension = path.extname(originalName).toLowerCase();
+  if (!label || !extension) return path.join(directory, path.basename(originalName));
+  return path.join(directory, nextSequentialImportName(directory, label, originalName));
+}
+
+async function archiveExternalPaths(filePaths, allowedKinds, { renameSequentially = false } = {}) {
+  const failed = [];
+  let imported = 0;
+  const projectAtStart = creativeProjectStore.active();
+  const serviceAtStart = activeServiceId;
+  // Snapshot the entire picker/drag operation before copying any bytes. A mode,
+  // project or episode switch while a large first file copies cannot reroute
+  // the later files in that same operation.
+  const planned = filePaths.map(sourcePath => {
+    const filename = path.basename(sourcePath);
+    const kind = classifyDownload({ filename, mode: 'video', serviceId: serviceAtStart || '' });
+    const safeMode = kind === 'image' ? 'image' : 'video';
+    const serviceId = validServiceForMode(safeMode, serviceAtStart) ? serviceAtStart : defaultServiceForMode(safeMode);
+    try {
+      if (!allowedKinds.has(kind)) throw new Error('仅支持所选类型的素材');
+      if (!serviceId) throw new Error('当前模式没有可用创作平台');
+      return { sourcePath, filename, kind, safeMode, serviceId, archiveContext: captureArchiveContext(serviceId, safeMode, kind, projectAtStart) };
+    } catch (error) { return { filename, error }; }
+  });
+  for (const entry of planned) {
+    if (entry.error) { failed.push(`${entry.filename}：${entry.error.message}`); continue; }
+    const { sourcePath, filename, kind, safeMode, serviceId, archiveContext } = entry;
+    const id = `import-${Date.now()}-${++downloadSequence}`;
+    let record;
+    try {
+      const target = resolveDownloadTarget({
+        projectRoot: PROJECT_ROOT,
+        obsidianVault: OBSIDIAN_VAULT,
+        serviceId,
+        serviceLabel: archiveContext.serviceLabel,
+        mode: safeMode,
+        filename,
+        mimeType: '',
+        projectDirectories: archiveContext.projectDirectories,
+        ...episodeTargetOptions(archiveContext.episodeSnapshot),
+      });
+      ensureArchiveDirectory(archiveContext.projectDirectories[kind], target.directory);
+      const chooseTarget = () => renameSequentially
+        ? sequentialImportTarget(target.directory, kind, filename, archiveContext.categoryLabel)
+        : uniquePath(path.join(target.directory, sanitizeFilename(filename)));
+      let targetPath = chooseTarget();
+      const totalBytes = fs.statSync(sourcePath).size;
+      record = {
+        id, serviceId, serviceLabel: `${archiveContext.serviceLabel} 外部下载`, mode: safeMode, kind,
+        filename: path.basename(targetPath), savePath: targetPath,
+        state: 'progressing', receivedBytes: 0, totalBytes, startedAt: new Date().toISOString(),
+        source: 'import',
+        productionSnapshot: archiveContext.productionSnapshot,
+        episodeSnapshot: archiveContext.episodeSnapshot,
+      };
+      recentDownloads.unshift(record);
+      if (recentDownloads.length > 50) recentDownloads.length = 50;
+      activeDownloadItems.set(id, { item: null, record });
+      broadcastDownload(record);
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await copyFileWithProgress(sourcePath, targetPath, (receivedBytes, total) => {
+            record.receivedBytes = receivedBytes;
+            record.totalBytes = total;
+            broadcastDownload(record);
+          });
+          break;
+        } catch (error) {
+          if (error.code !== 'EEXIST' || attempt >= 99) throw error;
+          targetPath = chooseTarget();
+          record.filename = path.basename(targetPath);
+          record.savePath = targetPath;
+          broadcastDownload(record);
+        }
+      }
+      record.state = 'completed';
+      record.receivedBytes = totalBytes;
+      record.endedAt = new Date().toISOString();
+      archiveDownloadInProduction(record);
+      imported++;
+      broadcastDownload(record);
+      sendMain('os:download-complete', publicDownload(record));
+    } catch (error) {
+      if (record) {
+        record.state = 'interrupted';
+        record.endedAt = new Date().toISOString();
+        record.error = `导入失败：${error.message}`;
+        broadcastDownload(record);
+      }
+      failed.push(`${filename}：${error.message}`);
+    } finally {
+      activeDownloadItems.delete(id);
+    }
+  }
+  if (imported) serverModule.broadcastCreativeAssets?.();
+  return { cancelled: false, imported, failed };
+}
+
+async function importExternalDownloads(mode) {
+  const safeMode = modeOrDefault(mode);
+  if (!creatorWindow || creatorWindow.isDestroyed()) throw new Error('创作浏览器尚未打开');
+  const filters = safeMode === 'image'
+    ? [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif', 'svg'] }]
+    : [{ name: '视频与音频', extensions: ['mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'wma', 'aiff', 'aif', 'amr', 'ape'] }];
+  const selection = await dialog.showOpenDialog(creatorWindow, {
+    title: safeMode === 'image' ? '导入系统浏览器下载的图片' : '导入系统浏览器下载的视频或音频',
+    buttonLabel: '导入并归档',
+    properties: ['openFile', 'multiSelections'],
+    filters,
+  });
+  if (selection.canceled || !selection.filePaths.length) return { cancelled: true, imported: 0, failed: [] };
+  const allowedKinds = safeMode === 'image' ? new Set(['image']) : new Set(['video', 'audio']);
+  return archiveExternalPaths(selection.filePaths, allowedKinds);
+}
+
+async function importLocalCreativeAssets() {
+  if (!creatorWindow || creatorWindow.isDestroyed()) throw new Error('创作浏览器尚未打开');
+  const selection = await dialog.showOpenDialog(creatorWindow, {
+    title: '添加图片、视频或音频到当前剧本',
+    buttonLabel: '添加到创作资产',
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: '图片、视频与音频', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif', 'mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'wma', 'aiff', 'aif', 'amr', 'ape'] }],
+  });
+  if (selection.canceled || !selection.filePaths.length) return { cancelled: true, imported: 0, failed: [] };
+  return archiveExternalPaths(selection.filePaths, new Set(['image', 'video', 'audio']));
+}
+
+function isPrivateRemoteHost(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host === '::1' || host.endsWith('.local')) return true;
+  if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return true;
+  const match = host.match(/^172\.(\d+)\./);
+  return !!match && Number(match[1]) >= 16 && Number(match[1]) <= 31;
+}
+
+const REMOTE_IMAGE_EXTENSIONS = Object.freeze({
+  'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif',
+  'image/bmp': '.bmp', 'image/avif': '.avif',
+});
+
+function remoteImageName(url, mimeType) {
+  if (String(url || '').startsWith('data:')) return `网页图片-${Date.now()}${REMOTE_IMAGE_EXTENSIONS[mimeType] || '.png'}`;
+  let name = '';
+  try { name = decodeURIComponent(path.posix.basename(new URL(url).pathname)); } catch {}
+  const extension = REMOTE_IMAGE_EXTENSIONS[mimeType] || '';
+  const acceptedExtensions = new Set(Object.values(REMOTE_IMAGE_EXTENSIONS));
+  if (!acceptedExtensions.has(path.extname(name).toLowerCase())) {
+    name = `网页图片-${Date.now()}${extension || '.png'}`;
+  }
+  return name;
+}
+
+function captureRemoteImageContext() {
+  const safeMode = 'image';
+  const serviceId = validServiceForMode(safeMode, activeServiceId) ? activeServiceId : defaultServiceForMode(safeMode);
+  if (!serviceId) throw new Error('图片模式没有可用创作平台');
+  return { serviceId, safeMode, ...captureArchiveContext(serviceId, safeMode, 'image'),
+    requestSession: activeView && !activeView.webContents.isDestroyed() ? activeView.webContents.session : null };
+}
+
+async function importRemoteImage(urlValue, archiveContext = captureRemoteImageContext()) {
+  const value = String(urlValue || '').trim();
+  if (value.startsWith('data:image/')) {
+    const match = value.match(/^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i);
+    if (!match || !REMOTE_IMAGE_EXTENSIONS[match[1].toLowerCase()]) throw new Error('网页图片数据格式不受支持');
+    const buffer = Buffer.from(match[2].replace(/\s/g, ''), 'base64');
+    if (!buffer.length || buffer.length > 100 * 1024 * 1024) throw new Error('网页图片为空或超过 100 MB');
+    return saveRemoteImageBuffer(buffer, value, match[1].toLowerCase(), archiveContext);
+  }
+  const url = new URL(value);
+  if (!['http:', 'https:'].includes(url.protocol) || isPrivateRemoteHost(url.hostname)) throw new Error('网页图片地址不受支持');
+  const requestSession = archiveContext.requestSession;
+  const response = requestSession
+    ? await requestSession.fetch(url.href, { credentials: 'include' })
+    : await net.fetch(url.href, { credentials: 'include' });
+  if (!response.ok) throw new Error(`网页图片下载失败（HTTP ${response.status}）`);
+  const mimeType = String(response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  if (!REMOTE_IMAGE_EXTENSIONS[mimeType]) throw new Error('拖入的网址不是受支持的图片');
+  const announcedSize = Number(response.headers.get('content-length') || 0);
+  if (announcedSize > 100 * 1024 * 1024) throw new Error('网页图片超过 100 MB');
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length || buffer.length > 100 * 1024 * 1024) throw new Error('网页图片为空或超过 100 MB');
+  return saveRemoteImageBuffer(buffer, url.href, mimeType, archiveContext);
+}
+
+async function saveRemoteImageBuffer(buffer, sourceUrl, mimeType, archiveContext) {
+  const { serviceId, safeMode } = archiveContext;
+  const filename = remoteImageName(sourceUrl, mimeType);
+  const target = resolveDownloadTarget({
+    projectRoot: PROJECT_ROOT, obsidianVault: OBSIDIAN_VAULT, serviceId,
+    serviceLabel: archiveContext.serviceLabel, mode: safeMode, filename, mimeType,
+    projectDirectories: archiveContext.projectDirectories,
+    ...episodeTargetOptions(archiveContext.episodeSnapshot),
+  });
+  ensureArchiveDirectory(archiveContext.projectDirectories.image, target.directory);
+  const targetPath = sequentialImportTarget(target.directory, 'image', filename, archiveContext.categoryLabel);
+  await fs.promises.writeFile(targetPath, buffer, { flag: 'wx' });
+  const id = `drop-${Date.now()}-${++downloadSequence}`;
+  const record = {
+    id, serviceId, serviceLabel: `${archiveContext.serviceLabel} 网页拖入`, mode: safeMode, kind: 'image',
+    filename: path.basename(targetPath), savePath: targetPath, state: 'completed',
+    receivedBytes: buffer.length, totalBytes: buffer.length, startedAt: new Date().toISOString(),
+    endedAt: new Date().toISOString(), source: 'import',
+    productionSnapshot: archiveContext.productionSnapshot,
+    episodeSnapshot: archiveContext.episodeSnapshot,
+  };
+  recentDownloads.unshift(record);
+  if (recentDownloads.length > 50) recentDownloads.length = 50;
+  archiveDownloadInProduction(record);
+  broadcastDownload(record);
+  sendMain('os:download-complete', publicDownload(record));
+  return record;
+}
+
+async function importDroppedCreativeAssets(payload = {}) {
+  const paths = Array.isArray(payload.paths) ? payload.paths.map(value => String(value || '')).filter(Boolean).slice(0, 100) : [];
+  const urls = Array.isArray(payload.urls) ? payload.urls.map(value => String(value || '')).filter(Boolean).slice(0, 20) : [];
+  let remoteContext, remoteContextError;
+  if (urls.length) {
+    try { remoteContext = captureRemoteImageContext(); } catch (error) { remoteContextError = error; }
+  }
+  const local = await archiveExternalPaths(paths, new Set(['image', 'video', 'audio']), { renameSequentially: true });
+  const failed = [...local.failed];
+  let imported = local.imported;
+  for (const url of urls) {
+    try { if (remoteContextError) throw remoteContextError; await importRemoteImage(url, remoteContext); imported++; }
+    catch (error) { failed.push(`网页图片：${error.message}`); }
+  }
+  if (imported) serverModule.broadcastCreativeAssets?.();
+  return { cancelled: false, imported, failed };
+}
+
+function securePopupOptions(ses) {
+  return {
+    parent: creatorWindow,
+    width: 980,
+    height: 760,
+    autoHideMenuBar: true,
+    backgroundColor: '#10162a',
+    webPreferences: {
+      session: ses,
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+    },
+  };
+}
+
+function installCreatorContextMenu(contents, ownerWindow = creatorWindow) {
+  if (!contents || contents.isDestroyed()) return;
+  contents.on('context-menu', (_event, params) => {
+    if (!ownerWindow || ownerWindow.isDestroyed() || contents.isDestroyed()) return;
+    const template = buildCreatorContextMenuTemplate({
+      contents,
+      params,
+      clipboard,
+      onError: error => appendLog(`浏览器右键菜单操作失败：${error.message}`),
+    });
+    if (!template.length) return;
+    Menu.buildFromTemplate(template).popup({ window: ownerWindow });
+  });
+}
+
+function createTab(serviceId, mode, { activate = true, id, initialUrl, customName = '', deferLoad = false, pinned = false } = {}) {
+  if (!creatorWindow || creatorWindow.isDestroyed()) throw new Error('创作浏览器尚未打开');
+  const safeMode = modeOrDefault(mode);
+  if (!validServiceForMode(safeMode, serviceId)) throw new Error('该平台不属于当前创作模式');
+  const service = serviceById(serviceId);
+  if (!service) throw new Error('未知创作平台');
+  const ses = session.fromPartition(`persist:video-os-creator-${serviceId}`);
+  configureSession(serviceId, ses);
+
+  const view = new WebContentsView({
+    webPreferences: {
+      session: ses,
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+    },
+  });
+  const contents = view.webContents;
+  // 新页首次绘制前也有不透明底色，双拼不会透出宿主的占位内容。
+  if (typeof view.setBackgroundColor === 'function') view.setBackgroundColor('#ffffff');
+  installCreatorContextMenu(contents);
+  // 标签声音角标：网页开始/停止出声时轻量广播（不落盘），驱动标签上的 🔊/🔇 角标。
+  contents.on('audio-state-changed', () => {
+    tab.audible = !contents.isDestroyed() && contents.isCurrentlyAudible();
+    sendCreator('creator:browser-state', browserState());
+  });
+  // 页内查找结果回传（Ctrl/Cmd+F 查找条显示“第几个/共几个”）
+  contents.on('found-in-page', (_event, result) => {
+    sendCreator('creator:find-result', {
+      activeMatchOrdinal: result.activeMatchOrdinal || 0,
+      matches: result.matches || 0,
+    });
+  });
+  // 浏览器级快捷键在平台页面聚焦时依然可用：主进程在这里拦截，
+  // 宿主页聚焦时的同名快捷键由 creator.js 的 keydown 处理，两条路径互不叠加。
+  // Cmd/Ctrl+W 必须在这里拦截为“关闭当前标签”，否则会命中 macOS 窗口菜单的
+  // close 角色，把整个工作台窗口关掉。
+  contents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown' || input.alt) return;
+    const mod = process.platform === 'darwin' ? input.meta : input.control;
+    if (!mod) return;
+    const key = String(input.key || '').toLowerCase();
+    try {
+      if (key === 'tab') {
+        event.preventDefault();
+        cycleBrowserTab(input.shift ? -1 : 1);
+      } else if (input.shift && key === 't') {
+        event.preventDefault();
+        restoreClosedTab();
+      } else if (input.shift && key === 'r') {
+        event.preventDefault();
+        const current = tabById(activeTabId);
+        if (current && !current.view.webContents.isDestroyed()) current.view.webContents.reloadIgnoringCache();
+      } else if (!input.shift && key === 'r') {
+        event.preventDefault();
+        const current = tabById(activeTabId);
+        if (current && !current.view.webContents.isDestroyed()) current.view.webContents.reload();
+      } else if (key === 'w') {
+        event.preventDefault();
+        closeTab(tab.id);
+      } else if (!input.shift && key === 'l') {
+        event.preventDefault();
+        sendCreator('creator:focus-address');
+      } else if (!input.shift && key === 'f') {
+        event.preventDefault();
+        sendCreator('creator:show-find-bar');
+      }
+    } catch (error) {
+      logDiagnostic('tab-shortcut', error.message || String(error));
+    }
+  });
+  // 用户点击网页时收起覆盖式资产库；不拦截原点击，网页按钮和输入框仍可直接操作。
+  // 双拼时只改焦点账本：不 preventDefault、不 focus()、不卸下另一栏，避免抢走正在拖入的那一页。
+  contents.on('before-mouse-event', (_event, input) => {
+    if (input.type !== 'mouseDown') return;
+    if (typeof adoptSplitPointer === 'function') adoptSplitPointer(tab, 'pointer');
+    if (contents === activeView?.webContents) dismissAssetOverlay();
+  });
+  contents.on('focus', () => {
+    if (typeof adoptSplitPointer === 'function') adoptSplitPointer(tab, 'focus');
+  });
+  contents.setWindowOpenHandler(({ url }) => {
+    const safeLoginBootstrap = /^(about:blank|about:srcdoc)$/i.test(url);
+    if (!safeLoginBootstrap && !isSafeWebUrl(url)) {
+      if (/^(mailto|tel):/i.test(url)) shell.openExternal(url).catch(() => {});
+      return { action: 'deny' };
+    }
+    return { action: 'allow', overrideBrowserWindowOptions: securePopupOptions(ses) };
+  });
+  contents.on('did-create-window', childWindow => {
+    downloadOwners.set(childWindow.webContents, tab);
+    installCreatorContextMenu(childWindow.webContents, childWindow);
+  });
+  contents.on('will-navigate', (event, url) => {
+    if (!isSafeWebUrl(url)) event.preventDefault();
+  });
+  const tab = {
+    id: id || `tab-${Date.now().toString(36)}-${++tabSequence}`,
+    serviceId,
+    mode: safeMode,
+    currentUrl: isSafeWebUrl(initialUrl) ? initialUrl : serviceUrl(serviceId),
+    customName,
+    pinned: !!pinned,
+    audible: false,
+    needsLoad: deferLoad,
+    view,
+    session: ses,
+    displayLabel: '',
+    error: '',
+    loadTimedOut: false,
+    loginRejected: false,
+    stoppedAfterTimeout: false,
+    loadTimer: null,
+    loadSeq: 0,
+  };
+  // 统一的标签内加载入口：带导航序号，失败回调只在“这次加载仍是最新一次”时写状态，
+  // 避免换页替换旧请求产生的 ERR_ABORTED 污染新页面的正常状态。
+  const loadInTab = (url, { manual = false } = {}) => {
+    tab.currentUrl = url;
+    tab.needsLoad = false;
+    persistBrowserSession();
+    const seq = ++tab.loadSeq;
+    return contents.loadURL(url).catch(error => {
+      if (seq !== tab.loadSeq) return;
+      const aborted = String(error.message).includes('ERR_ABORTED');
+      if (aborted) {
+        tab.error = tab.stoppedAfterTimeout
+          ? '已停止加载：站点长时间无响应。可重试，或改用系统浏览器打开。'
+          : '已停止加载。可重试，或改用系统浏览器打开。';
+      } else {
+        tab.error = `平台加载失败：${error.message}`;
+      }
+      if (tab.id === activeTabId) pushBrowserState();
+    });
+  };
+  const clearLoadTimer = () => {
+    if (tab.loadTimer) { clearTimeout(tab.loadTimer); tab.loadTimer = null; }
+  };
+  contents.on('did-start-loading', () => {
+    tab.error = '';
+    tab.loadTimedOut = false;
+    // 每轮导航独立计时：完成/失败/停止/新导航都会重置，避免旧计时器污染新页面。
+    clearLoadTimer();
+    tab.loadTimer = setTimeout(() => {
+      if (contents.isDestroyed() || !contents.isLoading()) return;
+      tab.loadTimer = null;
+      tab.loadTimedOut = true;
+      logDiagnostic(`tab-timeout:${serviceId}`, `加载超过 ${LOAD_TIMEOUT_MS}ms 未完成`);
+      if (tab.id === activeTabId) pushBrowserState();
+    }, LOAD_TIMEOUT_MS);
+    if (tab.id === activeTabId) pushBrowserState();
+  });
+  contents.on('did-stop-loading', () => {
+    clearLoadTimer();
+    tab.loadTimedOut = false;
+    if (tab.id === activeTabId) pushBrowserState();
+  });
+  contents.on('did-navigate', (_event, url) => {
+    if (isSafeWebUrl(url)) tab.currentUrl = url;
+    persistBrowserSession();
+    updateTabDisplayLabel(tab, url);
+    // Google 账号“拒绝内嵌登录”落地页：按精确主机+路径识别，普通页面自动清除。
+    tab.loginRejected = isLoginRejectedUrl(url);
+    if (tab.id === activeTabId) pushBrowserState();
+  });
+  contents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+    // 同页导航按当前主框架 URL 重算拒绝状态：
+    // - 仅子框架的跳转不得覆盖顶层拒绝状态；
+    // - 拒绝路径只变 hash 时 URL 主体不变，仍保持拒绝提示。
+    if (isMainFrame) {
+      if (isSafeWebUrl(url)) tab.currentUrl = url;
+      persistBrowserSession();
+      tab.loginRejected = isLoginRejectedUrl(url || contents.getURL());
+    }
+    if (tab.id === activeTabId) pushBrowserState();
+  });
+  contents.on('page-title-updated', () => { if (tab.id === activeTabId) pushBrowserState(); });
+  contents.on('did-fail-load', (_event, errorCode, errorDescription, _validatedUrl, isMainFrame) => {
+    if (!isMainFrame) { logDiagnostic(`tab-frame-fail:${serviceId}`, `subframe ${errorCode} ${errorDescription}`); return; }
+    if (errorCode === -3) { logDiagnostic(`tab-frame-fail:${serviceId}`, 'aborted(-3)'); return; }
+    logDiagnostic(`tab-fail:${serviceId}`, `${errorCode} ${errorDescription}`);
+    tab.error = `平台加载失败（${errorCode}）：${errorDescription}`;
+    if (tab.id === activeTabId) pushBrowserState();
+  });
+  contents.on('render-process-gone', (_event, details) => {
+    tab.error = `平台页面异常退出：${details.reason}`;
+    logDiagnostic(`platform:${serviceId}`, JSON.stringify(details));
+    if (tab.id === activeTabId) pushBrowserState();
+  });
+  browserTabs.set(tab.id, tab);
+  initializedModes[safeMode] = true;
+  tab.load = (url = tab.currentUrl) => loadInTab(url);
+  downloadOwners.set(contents, tab);
+  // 首次加载走统一入口：错误按“平台加载失败”归类，且被后续导航替换时不污染状态。
+  if (!deferLoad) tab.load().catch(error => {
+    logDiagnostic(`boot-load:${serviceId}`, error.message || String(error));
+  });
+  if (activate) activateTab(tab.id);
+  else persistBrowserSession();
+  return tab;
+}
+
+function activateTab(tabId) {
+  const tab = tabById(tabId);
+  if (!tab) throw new Error('创作标签不存在');
+  if (!creatorWindow || creatorWindow.isDestroyed()) throw new Error('创作浏览器尚未打开');
+  if (typeof splitViewSession !== 'undefined' && splitViewSession && splitViewSession.enabled && typeof planActivateTab === 'function') {
+    const plan = planActivateTab(splitViewSession, {
+      id: tab.id,
+      mode: tab.mode,
+      alive: !tab.view.webContents.isDestroyed(),
+    }, [...browserTabs.values()].map(item => ({
+      id: item.id,
+      mode: item.mode,
+      alive: !item.view.webContents.isDestroyed(),
+    })));
+    if (plan.action === 'focus') return focusSplitPaneNow(plan.pane, { programmatic: true });
+    if (plan.action === 'replace') splitViewSession = plan.state;
+    else if (plan.action === 'exit') {
+      splitViewSession = plan.state;
+      const children = creatorWindow.contentView.children || [];
+      for (const other of browserTabs.values()) {
+        if (other.view !== tab.view && children.includes(other.view)) {
+          try { creatorWindow.contentView.removeChildView(other.view); } catch {}
+        }
+      }
+    }
+  }
+  if (activeTabId) dismissAssetOverlay();
+  if (activeView && activeView !== tab.view) {
+    try { creatorWindow.contentView.removeChildView(activeView); } catch {}
+  }
+  activeView = tab.view;
+  activeTabId = tab.id;
+  activeServiceId = tab.serviceId;
+  activeMode = tab.mode;
+  lastModeTabs[tab.mode] = tab.id;
+  if (platformViewsRequestedHidden) {
+    // 切换发生在捕获／解码期间：新网页也必须留在模态后方，旧底图不能接管新视图。
+    chromeOverlaysHidden = true;
+    setPlatformViewHidden(true, true).catch(error => logDiagnostic('platform-backdrop', error));
+  }
+  if (tab.needsLoad) tab.load();
+  applyCreatorLayout({ reorder: true });
+  if (!chromeOverlaysHidden) {
+    if (typeof splitFocusDepth === 'number') splitFocusDepth++;
+    try { tab.view.webContents.focus(); }
+    finally { if (typeof splitFocusDepth === 'number') splitFocusDepth--; }
+  }
+  pushBrowserState();
+  return browserState();
+}
+
+function selectServiceTab(serviceId, mode) {
+  const safeMode = modeOrDefault(mode);
+  if (!validServiceForMode(safeMode, serviceId)) throw new Error('该平台不属于当前创作模式');
+  const last = tabById(lastModeTabs[safeMode]);
+  const existing = last?.serviceId === serviceId ? last
+    : [...browserTabs.values()].find(tab => tab.serviceId === serviceId && tab.mode === safeMode);
+  if (existing) return activateTab(existing.id);
+  createTab(serviceId, safeMode);
+  return browserState();
+}
+
+function switchBrowserMode(mode, preferredServiceId) {
+  const safeMode = modeOrDefault(mode);
+  const last = tabById(lastModeTabs[safeMode]);
+  if (last && validServiceForMode(safeMode, last.serviceId)) return activateTab(last.id);
+  const existing = [...browserTabs.values()].find(tab => tab.mode === safeMode && validServiceForMode(safeMode, tab.serviceId));
+  if (existing) return activateTab(existing.id);
+  if (initializedModes[safeMode]) return showEmptyBrowserMode(safeMode);
+  const serviceId = validServiceForMode(safeMode, preferredServiceId) ? preferredServiceId : defaultServiceForMode(safeMode);
+  return selectServiceTab(serviceId, safeMode);
+}
+
+function destroyTab(tab) {
+  if (tab.loadTimer) { clearTimeout(tab.loadTimer); tab.loadTimer = null; }
+  if (lastModeTabs[tab.mode] === tab.id) lastModeTabs[tab.mode] = null;
+  let splitChanged = false;
+  let splitWasActivePane = false;
+  if (typeof splitViewSession !== 'undefined' && splitViewSession && splitViewSession.enabled && typeof planTabDestroyed === 'function') {
+    const plan = planTabDestroyed(splitViewSession, tab.id);
+    if (plan.changed) {
+      splitChanged = true;
+      splitWasActivePane = tab.id === activeTabId;
+      splitViewSession = plan.state;
+    }
+  }
+  if (tab.id === activeTabId) {
+    activeView = null;
+    activeTabId = null;
+  }
+  if (!tab.view.webContents.isDestroyed()) {
+    try { creatorWindow?.contentView.removeChildView(tab.view); } catch {}
+    try { tab.view.webContents.close(); } catch {}
+  }
+  browserTabs.delete(tab.id);
+  if (splitChanged && !splitWasActivePane && typeof closingWorkspace !== 'undefined' && !closingWorkspace) {
+    try { applyCreatorLayout(); } catch {}
+  }
+}
+
+function closeTab(tabId) {
+  const tab = tabById(tabId);
+  if (!tab) return browserState();
+  const ids = [...browserTabs.values()].filter(candidate => candidate.mode === tab.mode).map(candidate => candidate.id);
+  const index = ids.indexOf(tab.id);
+  const wasActive = tab.id === activeTabId;
+  let splitSurvivorId = '';
+  if (typeof splitViewSession !== 'undefined' && splitViewSession && splitViewSession.enabled && typeof planTabDestroyed === 'function') {
+    const plan = planTabDestroyed(splitViewSession, tab.id);
+    if (plan.changed && plan.survivorId) splitSurvivorId = plan.survivorId;
+  }
+  // 撤销关闭：只记录用户逐个关闭的网页（清空/批量清理走 destroyTab，不入栈）
+  closedTabHistory.push({ serviceId: tab.serviceId, mode: tab.mode, url: tab.currentUrl, customName: tab.customName, pinned: !!tab.pinned });
+  if (closedTabHistory.length > 10) closedTabHistory.shift();
+  destroyTab(tab);
+  const survivor = splitSurvivorId ? tabById(splitSurvivorId) : null;
+  if (survivor && !survivor.view.webContents.isDestroyed()) {
+    // 关掉双拼的一侧时，留下的那一侧变成整页，不跳到标签条上的下一个，也不重载。
+    if (activeTabId !== survivor.id) {
+      activateTab(survivor.id);
+      return browserState();
+    }
+    pushBrowserState();
+    return browserState();
+  }
+  if (wasActive) {
+    const nextId = ids[index + 1] || ids[index - 1] || null;
+    if (nextId && browserTabs.has(nextId)) {
+      activateTab(nextId);
+      return browserState();
+    }
+    return showEmptyBrowserMode(activeMode);
+  } else {
+    pushBrowserState();
+  }
+  return browserState();
+}
+
+function selectTab(tabId) {
+  if (tabById(tabId)?.mode !== activeMode) throw new Error('请先切换到这个标签所属的创作模式');
+  return activateTab(tabId);
+}
+
+function createAssetView() {
+  if (assetView && !assetView.webContents.isDestroyed()) return assetView;
+  if (!creatorWindow || creatorWindow.isDestroyed()) throw new Error('创作浏览器尚未打开');
+
+  assetView = new WebContentsView({
+    webPreferences: {
+      preload: path.join(__dirname, 'asset-preload.cjs'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+    },
+  });
+  const contents = assetView.webContents;
+  assetViewGeneration += 1;
+  contents.on('will-navigate', (event, url) => {
+    if (!isLocalAppUrl(url)) event.preventDefault();
+  });
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  contents.on('did-finish-load', () => sendAssetPanelState());
+  contents.on('preload-error', (_event, preloadPath, error) => logDiagnostic(`asset-preload:${preloadPath}`, error));
+  contents.on('render-process-gone', (_event, details) => {
+    logDiagnostic('asset-view', JSON.stringify(details));
+    const failedView = assetView;
+    assetPanelState.open = false;
+    if (failedView && assetViewAttached && creatorWindow && !creatorWindow.isDestroyed()) {
+      try { creatorWindow.contentView.removeChildView(failedView); } catch {}
+    }
+    assetViewAttached = false;
+    assetView = null;
+    sendAssetPanelState();
+    applyCreatorLayout();
+  });
+  contents.loadURL(`${localServerInfo.url}/creator-assets.html`).catch(error => {
+    logDiagnostic('asset-view-load', error);
+  });
+  return assetView;
+}
+
+function attachAssetViewOnTop() {
+  if (!creatorWindow || creatorWindow.isDestroyed() || !assetView) return;
+  if (assetViewAttached) {
+    try { creatorWindow.contentView.removeChildView(assetView); } catch {}
+    assetViewAttached = false;
+  }
+  creatorWindow.contentView.addChildView(assetView);
+  assetViewAttached = true;
+}
+
+function applyCreatorLayout(options = {}) {
+  if (!creatorWindow || creatorWindow.isDestroyed()) return;
+  const trackLayout = typeof splitLayoutDepth === 'number';
+  if (trackLayout) splitLayoutDepth++;
+  try {
+  const splitPair = (typeof splitViewSession !== 'undefined' && splitViewSession && splitViewSession.enabled)
+    ? [tabById(splitViewSession.leftTabId), tabById(splitViewSession.rightTabId)]
+    : null;
+  const splitReady = !!(splitPair && splitPair[0] && splitPair[1]
+    && splitPair[0].view && splitPair[1].view
+    && splitPair[0].id !== splitPair[1].id
+    && !splitPair[0].view.webContents.isDestroyed()
+    && !splitPair[1].view.webContents.isDestroyed());
+  const surfaceOpen = workspaceSurface === 'creator' && creatorLayoutReady && !chromeOverlaysHidden;
+  // 单页仍只留当前网页。双拼时左右两栏同时留在窗口里，其余标签照旧卸下。
+  for (const tab of browserTabs.values()) {
+    const keep = surfaceOpen && (splitReady ? (tab === splitPair[0] || tab === splitPair[1]) : tab.view === activeView);
+    if (!keep && creatorWindow.contentView.children.includes(tab.view)) {
+      creatorWindow.contentView.removeChildView(tab.view);
+    }
+  }
+  assetViewAttached = !!assetView && creatorWindow.contentView.children.includes(assetView);
+  if (!surfaceOpen) {
+    if (assetViewAttached) creatorWindow.contentView.removeChildView(assetView);
+    assetViewAttached = false;
+    return;
+  }
+  browserBounds = clampBounds(browserBounds);
+  let reattachedPlatform = false;
+  const children = creatorWindow.contentView.children || [];
+  const mountViews = splitReady
+    ? (splitViewSession.focusedPane === 'right' ? [splitPair[0].view, splitPair[1].view] : [splitPair[1].view, splitPair[0].view])
+    : (activeView ? [activeView] : []);
+  for (const view of mountViews) {
+    if (!children.includes(view)) {
+      creatorWindow.contentView.addChildView(view);
+      reattachedPlatform = true;
+    }
+    if (splitReady && typeof view.setVisible === 'function') view.setVisible(true);
+  }
+  const panelOpen = !!assetPanelState.open;
+  const minimumBrowserWidth = Math.min(420, Math.floor(browserBounds.width / 2));
+  const panelWidth = Math.max(1, Math.min(assetPanelState.width, browserBounds.width - minimumBrowserWidth));
+  const platformBounds = { ...browserBounds };
+
+  if (panelOpen && assetPanelState.layout === 'push') {
+    platformBounds.width = browserBounds.width - panelWidth;
+  }
+  if (splitReady && typeof paneBounds === 'function') {
+    const panes = paneBounds(platformBounds, splitViewSession.ratio);
+    splitPair[0].view.setBounds(panes.left);
+    splitPair[1].view.setBounds(panes.right);
+  } else if (activeView) activeView.setBounds(platformBounds);
+
+  if (!panelOpen) {
+    if (assetView && assetViewAttached) {
+      try { creatorWindow.contentView.removeChildView(assetView); } catch {}
+      assetViewAttached = false;
+    }
+    sendAssetPanelState();
+    return;
+  }
+
+  const panel = createAssetView();
+  if (!assetViewAttached || options.reorder || reattachedPlatform) attachAssetViewOnTop();
+  panel.setBounds({
+    x: browserBounds.x + browserBounds.width - panelWidth,
+    y: browserBounds.y,
+    width: panelWidth,
+    height: browserBounds.height,
+  });
+  sendAssetPanelState();
+  } finally {
+    if (typeof splitIgnoreFocusUntil === 'number') splitIgnoreFocusUntil = Date.now() + 80;
+    if (trackLayout) splitLayoutDepth--;
+  }
+}
+
+function updateAssetPanel(patch = {}) {
+  const wasOpen = !!assetPanelState.open;
+  assetPanelState = normalizeAssetPanelState(patch);
+  applyCreatorLayout({ reorder: !!assetPanelState.open && !wasOpen });
+  if (platformViewsRequestedHidden) setPlatformViewHidden(true, true).catch(error => logDiagnostic('platform-backdrop', error));
+  return publicAssetPanelState();
+}
+
+function dismissAssetOverlay() {
+  if (chromeOverlaysHidden || !assetPanelState.open || assetPanelState.layout !== 'overlay') return;
+  // 只卸下原生视图，不销毁页面，重新打开时保留目录、筛选与滚动位置。
+  updateAssetPanel({ open: false });
+}
+
+function clampBounds(bounds) {
+  if (!creatorWindow || creatorWindow.isDestroyed()) return browserBounds;
+  const [contentWidth, contentHeight] = creatorWindow.getContentSize();
+  const number = value => Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
+  const x = Math.max(0, Math.min(number(bounds.x), Math.max(0, contentWidth - 120)));
+  const y = Math.max(0, Math.min(number(bounds.y), Math.max(0, contentHeight - 120)));
+  const width = Math.max(120, Math.min(number(bounds.width), contentWidth - x));
+  const height = Math.max(120, Math.min(number(bounds.height), contentHeight - y));
+  return { x, y, width, height };
+}
+
+function teardownCreatorViews() {
+  platformBackdropSequence += 1;
+  platformBackdropPending = null;
+  platformBackdropDisplayedKey = '';
+  if (typeof platformBackdropSnapshots !== 'undefined') platformBackdropSnapshots.clear();
+  platformViewsRequestedHidden = false;
+  if (typeof splitViewSession !== 'undefined' && typeof disableSplit === 'function') splitViewSession = disableSplit(splitViewSession);
+  activeView = null;
+  activeTabId = null;
+  assetView = null;
+  assetViewAttached = false;
+  chromeOverlaysHidden = false;
+  activeServiceId = null;
+  // BrowserWindow 销毁时会统一销毁其 ContentView 子树；此处再 close() 会在
+  // Windows 调试连接退出阶段形成重复销毁并触发 0x80000003 断点异常。
+  browserTabs.clear();
+  lastModeTabs.image = null;
+  lastModeTabs.video = null;
+}
+
+function hasActiveServiceDownload(serviceId) {
+  return [...activeDownloadItems.values()].some(transfer => transfer.record?.serviceId === serviceId
+    && ['progressing', 'paused'].includes(transfer.record?.state));
+}
+
+function closeServiceTabs(serviceId) {
+  let survivorId = '';
+  for (const tab of [...browserTabs.values()].filter(candidate => candidate.serviceId === serviceId)) {
+    if (typeof splitViewSession !== 'undefined' && splitViewSession && splitViewSession.enabled && typeof planTabDestroyed === 'function') {
+      const plan = planTabDestroyed(splitViewSession, tab.id);
+      if (plan.changed && plan.survivorId && plan.survivorId !== tab.id) survivorId = plan.survivorId;
+    }
+    destroyTab(tab);
+    if (survivorId && !tabById(survivorId)) survivorId = '';
+  }
+  if (survivorId && tabById(survivorId) && !tabById(activeTabId)) activateTab(survivorId);
+  persistBrowserSession();
+}
+
+function removeCreatorService(serviceId, customOnly = false) {
+  const service = serviceById(serviceId);
+  if (!service) throw new Error('创作网站不存在或已被移除');
+  if (customOnly && !service.custom) throw new Error('只能删除已添加的自定义网站');
+  if (hasActiveServiceDownload(serviceId)) throw new Error('该网站仍有下载任务，请完成或取消后再删除');
+  for (const mode of ['image', 'video']) {
+    if (validServiceForMode(mode, serviceId) && modeServices(mode).length <= 1) {
+      throw new Error(`${mode === 'image' ? '图片' : '视频'}模式至少需要保留一个网站`);
+    }
+  }
+  const result = service.custom
+    ? creatorPlatformStore.remove(serviceId)
+    : creatorPlatformStore.hideBuiltin(serviceId);
+  if (activeServiceId === serviceId) {
+    try {
+      const fallback = defaultServiceForMode(activeMode);
+      if (!fallback) throw new Error('当前模式没有可用网站');
+      selectServiceTab(fallback, activeMode);
+    }
+    catch (error) { logDiagnostic('creator-platform-remove-fallback', error); }
+  }
+  closeServiceTabs(serviceId);
+  return { id: serviceId, custom: !!service.custom, changed: result?.changed !== false };
+}
+
+function removeCustomService(serviceId) {
+  return removeCreatorService(serviceId, true);
+}
+
+function protectLocalWindow(win) {
+  win.webContents.on('will-navigate', (event, url) => {
+    if (!isLocalAppUrl(url)) {
+      event.preventDefault();
+      if (isSafeWebUrl(url)) shell.openExternal(url).catch(() => {});
+    }
+  });
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isSafeWebUrl(url)) shell.openExternal(url).catch(() => {});
+    return { action: 'deny' };
+  });
+}
+
+function enableRendererRecovery(win, scope) {
+  let recoveryUsed = false;
+  win.webContents.on('render-process-gone', (_event, details) => {
+    logDiagnostic(`${scope}-renderer`, JSON.stringify(details));
+    if (details.reason === 'clean-exit') return;
+    if (SMOKE_TEST) {
+      app.exit(1);
+      return;
+    }
+    if (!recoveryUsed) {
+      recoveryUsed = true;
+      logDiagnostic(`${scope}-renderer`, '首次异常，500ms 后自动重新加载');
+      setTimeout(() => {
+        if (!win.isDestroyed()) win.reload();
+      }, 500);
+      return;
+    }
+    logDiagnostic(`${scope}-renderer`, '自动恢复后再次异常，退出桌面版以触发网页兼容版');
+    app.exit(1);
+  });
+}
+
+function configureApplicationMenu() {
+  if (process.platform !== 'darwin') {
+    Menu.setApplicationMenu(null);
+    return;
+  }
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    { label: app.name, submenu: [{ role: 'about' }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { type: 'separator' }, { role: 'quit' }] },
+    { role: 'editMenu' },
+    { role: 'windowMenu' },
+  ]));
+}
+
+function macWindowChrome(trafficLightY = 18) {
+  if (process.platform !== 'darwin') return {};
+  return {
+    titleBarStyle: 'hiddenInset',
+    trafficLightPosition: { x: 16, y: trafficLightY },
+    vibrancy: 'under-window',
+    visualEffectState: 'active',
+  };
+}
+
+function ensureWorkspaceWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) return mainWindow;
+  const win = new BrowserWindow({
+    width: 1500, height: 930, minWidth: 980, minHeight: 680,
+    show: false, autoHideMenuBar: true,
+    backgroundColor: '#f5f5f7', title: '视频制作 OS',
+    ...macWindowChrome(18),
+    webPreferences: {
+      preload: path.join(__dirname, 'creator-preload.cjs'),
+      nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true,
+    },
+  });
+  // 两个工作页面共用同一个宿主窗口；第三方网页独立于宿主页面，切页不销毁标签。
+  mainWindow = creatorWindow = win;
+  protectLocalWindow(win);
+  win.webContents.on('preload-error', (_event, preloadPath, error) => logDiagnostic('workspace-preload:' + preloadPath, error));
+  enableRendererRecovery(win, 'workspace');
+  win.on('unresponsive', () => logDiagnostic('workspace-window', '窗口无响应'));
+  win.on('resize', () => applyCreatorLayout());
+  win.once('ready-to-show', () => { if (!SMOKE_TEST && !win.isDestroyed()) win.show(); });
+  win.on('close', () => {
+    persistBrowserSession();
+    closingWorkspace = true;
+    // 工作区宿主窗口关闭时单视频浮窗一并关闭（浮窗不独立存活，避免无主窗口继续置顶）。
+    closeFloatVideoWindow('workspace-closed');
+    // 摘下后保留的网页不在窗口子树中，真正关闭窗口时也要释放它们。
+    for (const tab of [...browserTabs.values()]) destroyTab(tab);
+    if (assetView && !assetView.webContents.isDestroyed()) {
+      try { win.contentView.removeChildView(assetView); } catch {}
+      assetView.webContents.close();
+    }
+    teardownCreatorViews();
+  });
+  win.on('closed', () => {
+    mainWindow = creatorWindow = null;
+    workspaceSurface = '';
+    creatorLayoutReady = false;
+    browserSessionRestored = false;
+    closingWorkspace = false;
+  });
+  restoreBrowserSession();
+  return win;
+}
+
+function navigateWorkspace(surface, params = {}) {
+  const navigate = async () => {
+    const win = ensureWorkspaceWindow();
+    const reused = workspaceSurface === surface && !win.webContents.isLoading();
+    if (!reused) {
+      workspaceSurface = surface;
+      creatorLayoutReady = false;
+      chromeOverlaysHidden = false;
+      platformBackdropSequence += 1;
+      platformBackdropPending = null;
+      platformViewsRequestedHidden = false;
+      // 浮窗属于创作浏览器的左栏联动：回到工作台界面时一并关闭，避免遗留无主置顶窗。
+      if (surface !== 'creator') closeFloatVideoWindow('workspace-closed');
+      applyCreatorLayout();
+      const address = new URL(surface === 'creator' ? '/creator.html' : '/', localServerInfo.url);
+      for (const [key, value] of Object.entries(params)) address.searchParams.set(key, value);
+      await win.loadURL(address.href);
+    }
+    if (!SMOKE_TEST) { win.show(); win.focus(); }
+    if (reused && surface === 'main' && params.projectPicker) {
+      sendMain('os:open-project-picker', { mode: params.projectPicker });
+    }
+    return { win, reused };
+  };
+  const result = workspaceNavigation.then(navigate);
+  workspaceNavigation = result.catch(() => {});
+  return result;
+}
+
+// 指针或网页自己的 focus 只更新地址栏和当前标签。这里不调用 focus()，也不卸下另一栏。
+function adoptSplitPointer(tab, reason) {
+  if (reason === 'focus' && typeof splitIgnoreFocusUntil === 'number' && Date.now() < splitIgnoreFocusUntil) return;
+  if (typeof splitLayoutDepth === 'number' && splitLayoutDepth > 0) return;
+  if (typeof splitFocusDepth === 'number' && splitFocusDepth > 0) return;
+  if (typeof splitViewSession === 'undefined' || !splitViewSession || !splitViewSession.enabled) return;
+  if (!tab || tab.id === activeTabId) return;
+  if (tab.id !== splitViewSession.leftTabId && tab.id !== splitViewSession.rightTabId) return;
+  if (!tab.view || tab.view.webContents.isDestroyed()) return;
+  const pane = tab.id === splitViewSession.rightTabId ? 'right' : 'left';
+  const trackFocus = typeof splitFocusDepth === 'number';
+  if (trackFocus) splitFocusDepth++;
+  try {
+    splitViewSession = { ...splitViewSession, focusedPane: pane, gutter: SPLIT_GUTTER };
+    activeView = tab.view;
+    activeTabId = tab.id;
+    activeServiceId = tab.serviceId;
+    activeMode = tab.mode;
+    lastModeTabs[tab.mode] = tab.id;
+    pushBrowserState();
+  } finally {
+    if (trackFocus) splitFocusDepth--;
+  }
+}
+
+function focusSplitPaneNow(pane, { programmatic = true } = {}) {
+  if (!creatorWindow || creatorWindow.isDestroyed()) throw new Error('创作浏览器尚未打开');
+  if (typeof splitViewSession === 'undefined' || !splitViewSession || !splitViewSession.enabled) throw new Error('当前没有并排网页');
+  const plan = planFocusPane(splitViewSession, pane);
+  const tab = tabById(plan.tabId);
+  if (!tab || !tab.view || tab.view.webContents.isDestroyed()) throw new Error('这个网页已关闭');
+  const changed = activeTabId !== tab.id;
+  splitViewSession = plan.state;
+  if (changed && activeTabId) dismissAssetOverlay();
+  activeView = tab.view;
+  activeTabId = tab.id;
+  activeServiceId = tab.serviceId;
+  activeMode = tab.mode;
+  lastModeTabs[tab.mode] = tab.id;
+  applyCreatorLayout();
+  if (programmatic && !chromeOverlaysHidden) {
+    splitFocusDepth++;
+    try { tab.view.webContents.focus(); }
+    finally { splitFocusDepth--; }
+  }
+  pushBrowserState();
+  return browserState();
+}
+
+function exitSplitToActivePage() {
+  if (typeof splitViewSession === 'undefined' || !splitViewSession || !splitViewSession.enabled) return;
+  splitViewSession = disableSplit(splitViewSession);
+  if (creatorWindow && !creatorWindow.isDestroyed()) applyCreatorLayout();
+  pushBrowserState();
+}
+
+function setSplitRatio(ratio) {
+  splitViewSession = planSetRatio(splitViewSession, ratio);
+  if (splitViewSession.enabled) applyCreatorLayout();
+  if (platformViewsRequestedHidden) setPlatformViewHidden(true, true).catch(error => logDiagnostic('platform-backdrop', error));
+  pushBrowserState();
+  return browserState();
+}
+
+function setSplitView(payload = {}) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('双拼参数无效');
+  if (!creatorWindow || creatorWindow.isDestroyed()) throw new Error('创作浏览器尚未打开');
+  const describe = tab => ({
+    id: tab.id,
+    mode: tab.mode,
+    serviceId: tab.serviceId,
+    alive: !!(tab.view && !tab.view.webContents.isDestroyed()),
+  });
+  const plan = planSetSplitView({
+    state: splitViewSession,
+    payload,
+    activeTabId,
+    activeMode,
+    tabs: [...browserTabs.values()].map(describe),
+    serviceAllowed: validServiceForMode,
+  });
+  if (plan.action === 'disable') {
+    const wasEnabled = splitViewSession.enabled;
+    splitViewSession = plan.state;
+    if (wasEnabled) {
+      applyCreatorLayout();
+      if (platformViewsRequestedHidden) setPlatformViewHidden(true, true).catch(error => logDiagnostic('platform-backdrop', error));
+      pushBrowserState();
+    }
+    return browserState();
+  }
+  let rightTabId = plan.rightTabId;
+  if (plan.createServiceId) {
+    const created = createTab(plan.createServiceId, plan.mode, { activate: false });
+    rightTabId = created.id;
+    if (created.needsLoad) created.load();
+  }
+  const left = tabById(plan.leftTabId);
+  const right = rightTabId ? tabById(rightTabId) : null;
+  if (!left || !right || left.id === right.id || left.view.webContents.isDestroyed() || right.view.webContents.isDestroyed()) {
+    throw new Error('双拼需要左右两个不同的网页');
+  }
+  if (left.mode !== right.mode || !validServiceForMode(left.mode, left.serviceId) || !validServiceForMode(right.mode, right.serviceId)) {
+    throw new Error('两个网页必须属于同一创作模式');
+  }
+  if (right.needsLoad) right.load();
+  if (left.needsLoad) left.load();
+  splitViewSession = {
+    enabled: true,
+    leftTabId: left.id,
+    rightTabId: right.id,
+    focusedPane: 'left',
+    ratio: plan.ratio,
+    gutter: SPLIT_GUTTER,
+  };
+  if (activeTabId && activeTabId !== left.id) dismissAssetOverlay();
+  activeView = left.view;
+  activeTabId = left.id;
+  activeServiceId = left.serviceId;
+  activeMode = left.mode;
+  lastModeTabs[left.mode] = left.id;
+  applyCreatorLayout({ reorder: true });
+  if (platformViewsRequestedHidden) setPlatformViewHidden(true, true).catch(error => logDiagnostic('platform-backdrop', error));
+  if (!chromeOverlaysHidden) {
+    splitFocusDepth++;
+    try { left.view.webContents.focus(); }
+    finally { splitFocusDepth--; }
+  }
+  pushBrowserState();
+  return browserState();
+}
+
+async function createMainWindow(pickerMode = '') {
+  return navigateWorkspace('main', pickerMode ? { projectPicker: modeOrDefault(pickerMode) } : {});
+}
+
+let creatorProjectId = '';
+
+async function createCreatorWindow(initialRequest = 'image') {
+  const request = initialRequest && typeof initialRequest === 'object' ? initialRequest : { mode: initialRequest };
+  const mode = modeOrDefault(request.mode);
+  const requestedProjectId = String(request.projectId || '').trim();
+  // The HTTP create/activate endpoint can update the store before this IPC.
+  // Compare with the project shown by the creator, not the already-updated store.
+  const previousProjectId = creatorProjectId || creativeProjectStore.active()?.id || '';
+  const project = requestedProjectId ? creativeProjectStore.activate(requestedProjectId) : creativeProjectStore.active();
+  if (!project) throw new Error('请先选择一个剧本或灵感工作区');
+  creatorProjectId = project.id;
+  // 换剧本：正在置顶的单视频不再属于当前剧本，立即关浮窗并通知左栏还原卡片（绝不拖出旧剧本文件）。
+  if (floatVideoState && floatVideoState.projectId !== project.id) closeFloatVideoWindow('project-changed');
+  productionStore?.activateProject(project.id);
+  serverModule.broadcastCreativeProjects?.();
+  serverModule.broadcastCreativeAssets?.();
+  serverModule.broadcastProduction?.();
+  activeMode = mode;
+  const projectChanged = !!(requestedProjectId && previousProjectId && requestedProjectId !== previousProjectId);
+  const { reused } = await navigateWorkspace('creator', { mode, project: project.id });
+  if (projectChanged) exitSplitToActivePage();
+  setImmediate(() => { recoverVideoDownloads().catch(error => logDiagnostic('video-download-recovery', error)); });
+  if (reused) {
+    sendCreator('creator:project-changed', project);
+    sendCreator('creator:set-mode', mode);
+    sendDownloadEpisodes(project);
+  }
+  if (assetView && !assetView.webContents.isDestroyed()) { assetViewGeneration += 1; assetView.webContents.reloadIgnoringCache(); }
+  return { ok: true, reused, project };
+}
+
+function requireCreativeAsset(relativePath, expectedType = '') {
+  const requested = String(relativePath || '').replace(/\\/g, '/');
+  const activeProject = creativeProjectStore.active();
+  if (!activeProject || (requested !== activeProject.folder && !requested.startsWith(`${activeProject.folder}/`))) {
+    throw new Error('资产不属于当前剧本');
+  }
+  const entry = resolveCreativeAsset(CREATIVE_ASSET_DIR, requested, 'file');
+  const type = entry ? (classifyCreativeAsset(entry.rel) || 'other') : '';
+  if (!entry || (expectedType && type !== expectedType)) {
+    throw new Error(expectedType === 'image' ? '图片不存在或不在创作资产库内' : '资产不存在或不在创作资产库内');
+  }
+  return { absolutePath: entry.abs, type };
+}
+
+function pathIsInside(root, target) {
+  if (!root || !target) return false;
+  let realRoot;
+  let realTarget;
+  try {
+    realRoot = fs.realpathSync(root);
+    realTarget = fs.realpathSync(target);
+  } catch {
+    return false;
+  }
+  const relative = path.relative(realRoot, realTarget);
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function allowedDownloadRevealPath(savePath) {
+  if (!savePath || !fs.existsSync(savePath)) return '';
+  const roots = [PROJECT_ROOT, CREATIVE_ASSET_DIR, OBSIDIAN_VAULT].filter(Boolean);
+  return roots.some(root => pathIsInside(root, savePath)) ? savePath : '';
+}
+
+function lookupDownloadSavePath(downloadId) {
+  const id = String(downloadId || '');
+  if (!id) return '';
+  const recent = recentDownloads.find(item => item.id === id);
+  if (recent?.pendingReview || (recent && recent.state !== 'completed')) return '';
+  if (recent?.savePath) return recent.savePath;
+  if (!productionStore || typeof productionStore.listInbox !== 'function') return '';
+  try {
+    const row = productionStore.listInbox({ limit: 200, includeDismissed: true })
+      .find(item => item.download_key === id);
+    return row?.asset_path || '';
+  } catch {
+    return '';
+  }
+}
+
+function resolveDragAbsolute(token) {
+  const value = String(token || '').replace(/\\/g, '/');
+  if (value.startsWith('download:')) {
+    const savePath = allowedDownloadRevealPath(lookupDownloadSavePath(value.slice('download:'.length)));
+    if (!savePath) throw new Error('这个下载还不能拖出');
+    return savePath;
+  }
+  if (value.startsWith('dl:')) {
+    const savePath = allowedDownloadRevealPath(lookupDownloadSavePath(value.slice(3)));
+    if (!savePath) throw new Error('这个下载还不能拖出');
+    return savePath;
+  }
+  return requireCreativeAsset(value).absolutePath;
+}
+
+function dragIconFor(absolutePath) {
+  const image = nativeImage.createFromPath(absolutePath);
+  if (image.isEmpty()) {
+    const type = classifyCreativeAsset(absolutePath);
+    const icon = nativeImage.createFromPath(path.join(__dirname, '..', 'assets', 'ui', 'creator', `${type === 'video' ? 'video' : type === 'audio' ? 'audio' : 'document'}-3d-v1.png`));
+    return (icon.isEmpty() ? nativeImage.createFromDataURL(DRAG_FALLBACK_ICON) : icon).resize({ width: 64, height: 64 });
+  }
+  const size = image.getSize();
+  const scale = Math.min(1, 72 / Math.max(size.width || 1, size.height || 1));
+  return scale < 1
+    ? image.resize({ width: Math.max(1, Math.round(size.width * scale)), height: Math.max(1, Math.round(size.height * scale)), quality: 'good' })
+    : image;
+}
+
+// —— 标签右键菜单窗（无边框小窗版原生菜单）——
+// 原生 Menu.popup 的消失由操作系统控制（点击别处立即消失），实现不了「消失前驻留 500ms」；
+// 使用独立无边框小窗：主进程推送白名单过滤后的条目，
+// blur / Esc 只启动驻留定时（500ms），驻留期内再次呼出＝取消消失、原地换内容；
+// 点选动作立即回执（不等 120ms 淡出动画），渲染层播完淡出后通知关窗。
+const TAB_MENU_DISMISS_DELAY_MS = 500;
+const TAB_MENU_FADE_MS = 120;
+let tabMenuWindow = null;
+// 当前菜单会话：{ settled, finish, owner, window, x, y, dwellTimer, fadeTimer, onOwnerClosed }
+let tabMenuSession = null;
+
+function isTrustedTabMenuSender(event) {
+  return !!tabMenuWindow && !tabMenuWindow.isDestroyed() && event.sender === tabMenuWindow.webContents;
+}
+
+function closeTabMenuWindowNow() {
+  if (tabMenuWindow && !tabMenuWindow.isDestroyed()) tabMenuWindow.close();
+}
+
+// 统一回执出口：resolve 之后驻留定时、owner 监听全部解除，结果只产出一次。
+function finishTabMenuSession(result) {
+  const session = tabMenuSession;
+  if (!session || session.settled) return;
+  session.settled = true;
+  clearTimeout(session.dwellTimer);
+  if (session.owner && !session.owner.isDestroyed()) session.owner.removeListener('closed', session.onOwnerClosed);
+  session.finish(result);
+}
+
+// blur / Esc / 鼠标离开后不立即关窗：驻留 TAB_MENU_DISMISS_DELAY_MS 再回执 cancelled 并关闭；
+// 驻留期内再次右键呼出会由 openTabMenuWindow 清掉这个定时器——「消失前被再次唤起＝不消失」。
+function startTabMenuDwell(reason = 'blur') {
+  const session = tabMenuSession;
+  if (!session || session.settled) return;
+  clearTimeout(session.dwellTimer);
+  session.dwellReason = reason;
+  session.dwellTimer = setTimeout(() => {
+    finishTabMenuSession(null);
+    closeTabMenuWindowNow();
+  }, TAB_MENU_DISMISS_DELAY_MS);
+}
+
+// 点选后的兜底收窗：正常由渲染层淡出 120ms 后 dismiss 关闭，这里防渲染层崩溃留下空窗。
+function scheduleTabMenuFadeClose(delay = TAB_MENU_FADE_MS) {
+  const session = tabMenuSession;
+  if (!session) return;
+  clearTimeout(session.fadeTimer);
+  session.fadeTimer = setTimeout(closeTabMenuWindowNow, Math.max(0, delay));
+}
+
+function createTabMenuWindow() {
+  // 背景色与菜单底色一致（白），避免首次显示白闪；transparent 关闭，圆角边框由窗口自身绘制。
+  const win = new BrowserWindow({
+    width: 224, height: 64,
+    frame: false, transparent: false, resizable: false, movable: false,
+    minimizable: false, maximizable: false, fullscreenable: false,
+    skipTaskbar: true, show: false, useContentSize: true,
+    backgroundColor: '#ffffff', title: '标签菜单',
+    webPreferences: {
+      preload: path.join(__dirname, 'tab-menu-preload.cjs'),
+      nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true,
+    },
+  });
+  win.setAlwaysOnTop(true, 'floating');
+  win.on('blur', () => startTabMenuDwell());
+  win.webContents.on('render-process-gone', () => { finishTabMenuSession(null); closeTabMenuWindowNow(); });
+  win.on('closed', () => {
+    if (tabMenuWindow === win) tabMenuWindow = null;
+    if (tabMenuSession && tabMenuSession.window === win) {
+      finishTabMenuSession(null);
+      tabMenuSession = null;
+    }
+  });
+  tabMenuWindow = win;
+  win.loadURL(`${localServerInfo.url}/tab-menu.html`).catch(error => logDiagnostic('tab-menu-load', error));
+  return win;
+}
+
+// 打开（或复用）菜单窗：Promise 解析为选中的动作 id；null = cancelled（blur/Esc 驻留到期、
+// creator 窗口关闭、渲染层崩溃、被下一次呼出覆盖）。
+function openTabMenuWindow({ owner, x, y, entries }) {
+  if (!localServerInfo) throw new Error('本地服务尚未就绪');
+  return new Promise(resolve => {
+    const reuse = tabMenuWindow && !tabMenuWindow.isDestroyed();
+    const win = reuse ? tabMenuWindow : createTabMenuWindow();
+    // 新呼出接管窗口：上一个会话的定时器与 owner 监听全部解除；还没回执（blur 驻留中、
+    // 或点选淡出中被再次呼出）按取消处理，与「驻留期内再次呼出＝不消失」诉求一致。
+    if (tabMenuSession) {
+      clearTimeout(tabMenuSession.dwellTimer);
+      clearTimeout(tabMenuSession.fadeTimer);
+      finishTabMenuSession(null);
+      if (tabMenuSession.owner && !tabMenuSession.owner.isDestroyed()) {
+        tabMenuSession.owner.removeListener('closed', tabMenuSession.onOwnerClosed);
+      }
+    }
+    const session = {
+      settled: false, finish: resolve, owner, window: win, x, y,
+      dwellTimer: 0, fadeTimer: 0, dwellReason: '', pointerInitialized: false,
+      onOwnerClosed: () => { finishTabMenuSession(null); closeTabMenuWindowNow(); },
+    };
+    tabMenuSession = session;
+    owner.once('closed', session.onOwnerClosed);
+    const deliver = () => {
+      if (win.isDestroyed()) return;
+      win.webContents.send('tab-menu:show', { items: entries });
+    };
+    if (reuse && !win.webContents.isLoading()) {
+      deliver();
+    } else {
+      // 首建（或页面还在加载）：did-finish-load 后再推条目
+      win.webContents.once('did-finish-load', deliver);
+      win.webContents.once('did-fail-load', () => { finishTabMenuSession(null); closeTabMenuWindowNow(); });
+    }
+  });
+}
+
+// 渲染层回报内容尺寸后定位：creator 窗口内容区坐标 → 屏幕坐标，再按显示器 workArea 钳制，
+// 保证菜单完整可见（距可用区边缘至少 8px，与 creator 页 DOM 菜单的贴边策略一致）。
+ipcMain.on('tab-menu:report-size', (event, payload = {}) => {
+  if (!isTrustedTabMenuSender(event)) return;
+  const session = tabMenuSession;
+  if (!session || session.window !== tabMenuWindow || tabMenuWindow.isDestroyed()) return;
+  const ownerBounds = session.owner && !session.owner.isDestroyed()
+    ? session.owner.getContentBounds()
+    : { x: 0, y: 0 };
+  const desiredX = Math.round(ownerBounds.x + session.x);
+  const desiredY = Math.round(ownerBounds.y + session.y);
+  let area = null;
+  try {
+    area = screen.getDisplayNearestPoint({ x: desiredX, y: desiredY }).workArea;
+  } catch (error) {
+    logDiagnostic('tab-menu-position', error);
+  }
+  const maxWidth = area ? Math.min(480, Math.max(1, area.width - 16)) : 480;
+  const maxHeight = area ? Math.min(640, Math.max(1, area.height - 16)) : 640;
+  const width = Math.min(maxWidth, Math.max(160, Math.round(Number(payload.width) || 224)));
+  const height = Math.min(maxHeight, Math.max(48, Math.round(Number(payload.height) || 64)));
+  tabMenuWindow.setContentSize(width, height);
+  const [outerWidth, outerHeight] = tabMenuWindow.getSize();
+  let finalX = desiredX;
+  let finalY = desiredY;
+  if (area) {
+    finalX = Math.max(area.x + 8, Math.min(desiredX, area.x + area.width - outerWidth - 8));
+    finalY = Math.max(area.y + 8, Math.min(desiredY, area.y + area.height - outerHeight - 8));
+  }
+  tabMenuWindow.setPosition(finalX, finalY);
+  if (!tabMenuWindow.isVisible()) {
+    tabMenuWindow.show();
+    tabMenuWindow.focus();
+  }
+  if (!session.pointerInitialized) {
+    session.pointerInitialized = true;
+    // 首次加载或贴边定位时，光标可能从未进入菜单，因此也不会产生 pointerleave。
+    const cursor = screen.getCursorScreenPoint();
+    const bounds = tabMenuWindow.getContentBounds();
+    if (cursor.x < bounds.x || cursor.y < bounds.y
+      || cursor.x >= bounds.x + bounds.width || cursor.y >= bounds.y + bounds.height) {
+      startTabMenuDwell('pointer-leave');
+    }
+  }
+});
+
+ipcMain.on('tab-menu:pointer-state', (event, payload = {}) => {
+  if (!isTrustedTabMenuSender(event) || typeof payload.inside !== 'boolean') return;
+  const session = tabMenuSession;
+  if (!session || session.window !== tabMenuWindow || session.settled) return;
+  if (!payload.inside) {
+    // Esc 或失焦的关闭请求不应被随后产生的指针事件覆盖。
+    if (!session.dwellTimer || session.dwellReason === 'pointer-leave') startTabMenuDwell('pointer-leave');
+  } else if (session.dwellReason === 'pointer-leave') {
+    clearTimeout(session.dwellTimer);
+    session.dwellTimer = 0;
+    session.dwellReason = '';
+  }
+});
+
+ipcMain.on('tab-menu:pick', (event, payload = {}) => {
+  if (!isTrustedTabMenuSender(event)) return;
+  const session = tabMenuSession;
+  if (!session || session.window !== tabMenuWindow || session.settled) return;
+  const id = typeof payload.id === 'string' ? payload.id : '';
+  // 双保险：渲染层被攻破也只能回传白名单动作
+  if (!ALLOWED_TAB_MENU_ACTIONS.has(id)) return;
+  finishTabMenuSession(id);
+  // 点选不驻留：回执已发出，只等渲染层播完 120ms 淡出后 dismiss 收窗（这里留兜底定时）
+  scheduleTabMenuFadeClose(TAB_MENU_FADE_MS + 300);
+});
+
+ipcMain.on('tab-menu:dismiss', event => {
+  if (!isTrustedTabMenuSender(event)) return;
+  const session = tabMenuSession;
+  if (!session || session.window !== tabMenuWindow || tabMenuWindow.isDestroyed()) return;
+  if (session.settled) {
+    // 点选淡出完成后的收尾信号：立即关窗
+    clearTimeout(session.fadeTimer);
+    closeTabMenuWindowNow();
+    return;
+  }
+  // Esc：与 blur 同一条驻留路径，500ms 后才回执 cancelled
+  startTabMenuDwell('escape');
+});
+
+// 非模态项目／网页列表使用独立原生浮层；平台视图保持附着，不以整页隐藏让出 HTML 菜单。
+let workspaceMenuSession = null;
+let workspaceMenuSequence = 0;
+
+function closeWorkspaceMenu(result = { cancelled: true }) {
+  const current = workspaceMenuSession;
+  if (!current || current.settled) return;
+  current.settled = true;
+  workspaceMenuSession = null;
+  clearTimeout(current.loadTimer);
+  for (const [name, handler] of current.ownerHandlers) current.owner.removeListener(name, handler);
+  current.resolve(result);
+  if (!current.window.isDestroyed()) current.window.close();
+}
+
+function platformBackdropLayout() {
+  const region = { ...browserBounds };
+  const minimumBrowserWidth = Math.min(420, Math.floor(region.width / 2));
+  const panelWidth = Math.max(1, Math.min(assetPanelState.width, region.width - minimumBrowserWidth));
+  const platform = { ...region, width: region.width - (assetPanelState.open && assetPanelState.layout === 'push' ? panelWidth : 0) };
+  const pair = splitViewSession.enabled ? [tabById(splitViewSession.leftTabId), tabById(splitViewSession.rightTabId)] : [];
+  const frames = [];
+  const add = (view, pane, bounds) => {
+    if (!view || view.webContents.isDestroyed()) return;
+    frames.push({ view, pane, bounds: { ...bounds, x: bounds.x - region.x, y: bounds.y - region.y } });
+  };
+  if (pair.length === 2 && pair.every(tab => tab?.view && !tab.view.webContents.isDestroyed())) {
+    const panes = paneBounds(platform, splitViewSession.ratio);
+    add(pair[0].view, 'left', panes.left);
+    add(pair[1].view, 'right', panes.right);
+  } else add(activeView, 'single', platform);
+  if (assetPanelState.open) add(assetView, 'asset', { x: region.x + region.width - panelWidth, y: region.y, width: panelWidth, height: region.height });
+  const key = JSON.stringify([region, frames.map(frame => [frame.view.webContents.id, frame.view.webContents.getURL(), frame.pane, frame.bounds])]);
+  return { region: { width: region.width, height: region.height }, frames, key };
+}
+
+function setPlatformViewHidden(hidden, refresh = false) {
+  if (!hidden || !platformViewsRequestedHidden) platformBackdropSnapshots.clear();
+  platformViewsRequestedHidden = hidden;
+  const layout = hidden ? platformBackdropLayout() : null;
+  if (hidden && platformBackdropPending?.key === layout.key) return platformBackdropPending.promise;
+  const sequence = ++platformBackdropSequence;
+  platformBackdropPending = null;
+  if (!hidden) {
+    platformBackdropDisplayedKey = '';
+    sendCreator('creator:platform-backdrop', { image: '', frames: [], sequence });
+    if (chromeOverlaysHidden) { chromeOverlaysHidden = false; applyCreatorLayout({ reorder: true }); }
+    return Promise.resolve(browserState());
+  }
+  if (chromeOverlaysHidden && !refresh && platformBackdropDisplayedKey === layout.key) return Promise.resolve(browserState());
+  const pending = { key: layout.key, promise: null };
+  pending.promise = (async () => {
+    // 同时截取左右页（及已打开的资产面板），各自保留位置；不合成巨幅位图、不落盘。
+    const frames = await Promise.all(layout.frames.map(async ({ view, pane, bounds }) => {
+      const snapshotKey = JSON.stringify([view.webContents.id, view.webContents.getURL()]);
+      // A detached renderer may no longer paint on either desktop platform.
+      // Resize the frozen modal background, not a live page behind the modal.
+      const frozen = chromeOverlaysHidden ? platformBackdropSnapshots.get(snapshotKey) : '';
+      if (frozen) return { pane, bounds, image: frozen, snapshotKey };
+      let image = '';
+      try {
+        const capture = await Promise.race([view.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true }), new Promise(resolve => setTimeout(() => resolve(null), 200))]);
+        if (capture && !capture.isEmpty()) image = capture.toDataURL();
+      } catch { logDiagnostic('platform-backdrop', '无法读取临时页面底图'); }
+      return { pane, bounds, image, snapshotKey };
+    }));
+    const current = () => platformViewsRequestedHidden && sequence === platformBackdropSequence && workspaceSurface === 'creator'
+      && creatorLayoutReady && creatorWindow && !creatorWindow.isDestroyed() && layout.key === platformBackdropLayout().key;
+    if (!current()) return browserState();
+    platformBackdropSnapshots.clear();
+    for (const frame of frames) if (frame.image) platformBackdropSnapshots.set(frame.snapshotKey, frame.image);
+    platformBackdropDisplayedKey = layout.key;
+    sendCreator('creator:platform-backdrop', { image: frames[0]?.image || '',
+      frames: frames.map(({ snapshotKey, ...frame }) => frame), region: layout.region, sequence });
+    if (frames.some(frame => frame.image)) {
+      // 只等本地宿主图像解码；截图永不写盘。100ms兜底保持模态仍可操作。
+      await creatorWindow.webContents.executeJavaScript(`Promise.race([
+        new Promise(resolve => requestAnimationFrame(() => {
+          const images = [...document.querySelectorAll('#platformBackdropLayer img:not([hidden])')];
+          Promise.all(images.map(image => Promise.resolve(image.decode?.()).catch(() => {})))
+            .then(() => requestAnimationFrame(() => resolve(true)));
+        })), new Promise(resolve => setTimeout(() => resolve(false), 100))
+      ])`).catch(() => {});
+    }
+    if (!current()) return browserState();
+    chromeOverlaysHidden = true;
+    applyCreatorLayout({ reorder: true });
+    return browserState();
+  })().finally(() => { if (platformBackdropPending === pending) platformBackdropPending = null; });
+  platformBackdropPending = pending;
+  return pending.promise;
+}
+
+function trustedWorkspaceMenuSession(event, payload = {}) {
+  const current = workspaceMenuSession;
+  if (!current || current.settled || current.window.isDestroyed() || event.sender !== current.window.webContents
+    || payload.token !== current.token || !isLocalAppUrl(event.sender.getURL())) return null;
+  try { if (new URL(event.sender.getURL()).pathname !== '/workspace-menu.html') return null; } catch { return null; }
+  return current;
+}
+
+function positionWorkspaceMenu(current) {
+  if (!current || current !== workspaceMenuSession || current.window.isDestroyed() || current.owner.isDestroyed()) return;
+  const base = current.owner.getContentBounds();
+  const zoom = current.owner.webContents.getZoomFactor();
+  const x = Math.round(base.x + current.x * zoom), y = Math.round(base.y + current.y * zoom);
+  const area = screen.getDisplayNearestPoint({ x, y }).workArea;
+  const width = Math.min(current.width, Math.max(120, area.width - 16));
+  const height = Math.min(current.height, Math.max(64, area.height - 16));
+  current.window.setContentSize(width, height);
+  const outer = current.window.getBounds();
+  current.window.setPosition(Math.max(area.x + 8, Math.min(x, area.x + area.width - outer.width - 8)),
+    Math.max(area.y + 8, Math.min(y, area.y + area.height - outer.height - 8)));
+}
+
+function openWorkspaceMenu(owner, payload) {
+  closeWorkspaceMenu();
+  const kind = payload.kind;
+  if (kind !== 'projects' && kind !== 'tabs') throw new Error('工作区菜单类型无效');
+  const mode = activeMode;
+  const tabIndexes = new Map();
+  const items = kind === 'projects'
+    ? creativeProjectStore.list().map(project => ({ id: project.id, label: project.name + (project.available === false ? '（目录不可用）' : ''),
+      active: project.id === creativeProjectStore.active()?.id, enabled: project.available !== false }))
+    : publicTabs().filter(tab => tab.mode === mode && validServiceForMode(mode, tab.serviceId)).map(tab => {
+      const index = (tabIndexes.get(tab.serviceId) || 0) + 1; tabIndexes.set(tab.serviceId, index);
+      return { id: tab.id, label: tab.customName || (index > 1 ? `${tab.label}·${index}` : tab.label),
+        platform: serviceById(tab.serviceId)?.label || '', active: tab.active, enabled: true };
+    });
+  const [ownerWidth, ownerHeight] = owner.getContentSize(), zoom = owner.webContents.getZoomFactor();
+  const coordinate = (value, maximum, fallback) => Number.isFinite(Number(value)) ? Math.max(0, Math.min(maximum / zoom, Number(value))) : fallback;
+  const x = coordinate(payload.x, ownerWidth, 8), y = coordinate(payload.y, ownerHeight, 74);
+  const win = new BrowserWindow({ width: 320, height: 420, parent: owner, frame: false, resizable: false, movable: false,
+    minimizable: false, maximizable: false, fullscreenable: false, skipTaskbar: true, show: false,
+    backgroundColor: '#ffffff', title: kind === 'projects' ? '切换剧本' : '全部网页',
+    webPreferences: { preload: path.join(__dirname, 'workspace-menu-preload.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true } });
+  win.setAlwaysOnTop(true, 'floating');
+  return new Promise(resolve => {
+    const current = { token: `workspace-${++workspaceMenuSequence}`, window: win, owner, resolve, settled: false,
+      kind, mode, items, x, y, width: 320, height: 420, loadTimer: 0, ownerHandlers: [] };
+    workspaceMenuSession = current;
+    const cancel = () => { if (workspaceMenuSession === current) closeWorkspaceMenu(); };
+    const ownerChanged = () => positionWorkspaceMenu(current);
+    for (const name of ['resize', 'move']) { owner.on(name, ownerChanged); current.ownerHandlers.push([name, ownerChanged]); }
+    for (const name of ['closed', 'hide', 'minimize']) { owner.on(name, cancel); current.ownerHandlers.push([name, cancel]); }
+    win.on('blur', cancel); win.on('closed', cancel);
+    win.webContents.on('render-process-gone', cancel);
+    win.webContents.on('will-navigate', (event, url) => {
+      if (!isLocalAppUrl(url) || new URL(url).pathname !== '/workspace-menu.html') event.preventDefault();
+    });
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    current.loadTimer = setTimeout(cancel, 12000);
+    win.webContents.once('did-finish-load', () => {
+      if (workspaceMenuSession !== current || win.isDestroyed()) return;
+      const base = owner.getContentBounds(), area = screen.getDisplayNearestPoint({ x: base.x + x, y: base.y + y }).workArea;
+      win.webContents.send('workspace-menu:show', { token: current.token, kind, mode, items, listMaxHeight: Math.max(80, area.height - 160) });
+    });
+    win.webContents.once('did-fail-load', cancel);
+    win.loadURL(`${localServerInfo.url}/workspace-menu.html`).catch(cancel);
+  });
+}
+
+ipcMain.handle('creator:show-workspace-menu', (event, payload = {}) => {
+  requireTrusted(event, 'creator');
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('工作区菜单参数无效');
+  if (!creatorWindow || creatorWindow.isDestroyed() || !localServerInfo) return { cancelled: true };
+  return openWorkspaceMenu(creatorWindow, payload);
+});
+
+ipcMain.handle('creator:close-workspace-menu', event => {
+  requireTrusted(event, 'creator'); closeWorkspaceMenu(); return { cancelled: true };
+});
+
+ipcMain.on('workspace-menu:report-size', (event, payload = {}) => {
+  const current = trustedWorkspaceMenuSession(event, payload); if (!current) return;
+  current.width = Math.max(160, Math.min(480, Math.round(Number(payload.width) || 320)));
+  current.height = Math.max(64, Math.min(640, Math.round(Number(payload.height) || 420)));
+  positionWorkspaceMenu(current);
+  clearTimeout(current.loadTimer);
+  if (!current.window.isVisible()) { current.window.show(); current.window.focus(); }
+});
+
+ipcMain.on('workspace-menu:dismiss', (event, payload = {}) => {
+  if (trustedWorkspaceMenuSession(event, payload)) closeWorkspaceMenu();
+});
+
+ipcMain.on('workspace-menu:pick', (event, payload = {}) => {
+  const current = trustedWorkspaceMenuSession(event, payload); if (!current) return;
+  const action = payload.action, id = typeof payload.id === 'string' ? payload.id : '';
+  const item = current.items.find(entry => entry.id === id && entry.enabled !== false);
+  if (current.kind === 'projects') {
+    if (action !== 'manage' && (!['select', 'migrate'].includes(action) || !item
+      || !creativeProjectStore.list().some(project => project.id === id && project.available !== false))) return;
+  } else {
+    const tab = tabById(id);
+    if (action !== 'select' || !item || activeMode !== current.mode || !tab || tab.mode !== current.mode || tab.view.webContents.isDestroyed()) return;
+  }
+  const base = current.owner.getContentBounds(), popup = current.window.getContentBounds(), zoom = current.owner.webContents.getZoomFactor();
+  const [width, height] = current.window.getContentSize();
+  const local = (value, maximum) => Math.max(0, Math.min(maximum, Number(value) || 0));
+  const result = { action, ...(action === 'manage' ? {} : { id }),
+    x: (popup.x + local(payload.x, width) - base.x) / zoom, y: (popup.y + local(payload.y, height) - base.y) / zoom };
+  closeWorkspaceMenu(result);
+});
+
+// —— 标签菜单小窗 · 确定性自测钩子（VIDEO_OS_TAB_MENU_TEST=1 时启用）——
+// 真实走 creator:show-tab-menu IPC → 菜单小窗 → 点选/取消回执全链路，供 test_creator_context_menu.cjs 驱动。
+const sleepMs = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function waitForTabMenuReady(check, rounds = 80) {
+  for (let i = 0; i < rounds; i++) {
+    if (await check()) return true;
+    await sleepMs(50);
+  }
+  return await check();
+}
+
+async function waitForTabMenuItems() {
+  const read = async () => {
+    if (!tabMenuWindow || tabMenuWindow.isDestroyed()) return null;
+    return tabMenuWindow.webContents.executeJavaScript(
+      `[...document.querySelectorAll('.tab-context-item')].map(item => ({ id: item.dataset.action || '', disabled: item.disabled, danger: item.classList.contains('danger') }))`
+    ).catch(() => null);
+  };
+  for (let i = 0; i < 80; i++) {
+    const items = await read();
+    if (Array.isArray(items) && items.length) return items;
+    await sleepMs(50);
+  }
+  throw new Error('菜单小窗未在时限内渲染出条目');
+}
+
+// 从 creator 渲染层发起真实 invoke；结果落到 window.__tabMenuProbeLog（数组按回执顺序）
+async function invokeTabMenuFromCreator(items, x = 80, y = 60) {
+  return creatorWindow.webContents.executeJavaScript(`
+    window.__tabMenuProbeLog = [];
+    window.creatorAPI.showTabContextMenu({ x: ${Number(x)}, y: ${Number(y)}, items: ${JSON.stringify(items)} })
+      .then(result => { window.__tabMenuProbeLog.push(result); },
+            error => { window.__tabMenuProbeLog.push({ invokeError: String(error && error.message || error) }); });
+    'invoked'
+  `);
+}
+
+async function readTabMenuProbes() {
+  return creatorWindow.webContents.executeJavaScript('window.__tabMenuProbeLog || []');
+}
+
+async function runTabMenuSelfTest() {
+  for (let i = 0; i < 100 && (!creatorWindow || creatorWindow.isDestroyed()); i++) await sleepMs(50);
+  if (!creatorWindow || creatorWindow.isDestroyed()) throw new Error('创作窗口未就绪');
+  if (!await waitForTabMenuReady(() => creatorWindow.webContents.executeJavaScript(
+    "document.body?.dataset.ready === 'true'"
+  ))) throw new Error('创作页面初始化未在时限内完成');
+  const health = {};
+  const menuAlive = () => !!tabMenuWindow && !tabMenuWindow.isDestroyed() && tabMenuWindow.isVisible();
+
+  // ① 白名单过滤 + 定位钳制 + 点选回执：非白名单 id / 空 id 不渲染，窗口完整落在 workArea 内
+  await invokeTabMenuFromCreator([
+    { id: 'pin', label: '固定标签' },
+    { id: 'evil-action', label: '不该出现' },
+    { id: '', label: '空id' },
+    { separator: true },
+    { id: 'close', label: '关闭标签' },
+  ]);
+  let items = await waitForTabMenuItems();
+  if (items.some(item => item.id === 'evil-action' || item.id === '')) throw new Error(`白名单外条目被渲染：${JSON.stringify(items)}`);
+  if (!items.some(item => item.id === 'pin') || !items.some(item => item.id === 'close')) throw new Error(`白名单内条目丢失：${JSON.stringify(items)}`);
+  const bounds = tabMenuWindow.getBounds();
+  const area = screen.getDisplayNearestPoint({ x: bounds.x, y: bounds.y }).workArea;
+  if (bounds.x < area.x || bounds.y < area.y
+    || bounds.x + bounds.width > area.x + area.width + 1
+    || bounds.y + bounds.height > area.y + area.height + 1) {
+    throw new Error(`菜单窗越出显示器可用区：${JSON.stringify({ bounds, area })}`);
+  }
+  health.filterAndPosition = 'pass';
+  await tabMenuWindow.webContents.executeJavaScript(`document.querySelector('[data-action="pin"]')?.click()`);
+  if (!await waitForTabMenuReady(async () => (await readTabMenuProbes()).some(r => r && r.action === 'pin'))) {
+    throw new Error(`点选回执缺失：${JSON.stringify(await readTabMenuProbes())}`);
+  }
+  health.pickReceipt = 'pass';
+  if (!await waitForTabMenuReady(async () => !menuAlive())) throw new Error('点选后菜单窗未在时限内关闭');
+  await sleepMs(50);
+
+  // ② 禁用项 + Esc 驻留：点禁用项无回执，Esc 不立即关窗，驻留 500ms 后回执 cancelled
+  await invokeTabMenuFromCreator([
+    { id: 'close-left', label: '关闭左侧标签', enabled: false },
+    { id: 'close', label: '关闭标签' },
+  ]);
+  items = await waitForTabMenuItems();
+  const disabledItem = items.find(item => item.id === 'close-left');
+  if (!disabledItem || disabledItem.disabled !== true) throw new Error(`禁用态未渲染：${JSON.stringify(items)}`);
+  await tabMenuWindow.webContents.executeJavaScript(`document.querySelector('[data-action="close-left"]')?.click()`);
+  await sleepMs(200);
+  if ((await readTabMenuProbes()).length) throw new Error('禁用项点击产生了回执');
+  await tabMenuWindow.webContents.executeJavaScript(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))`);
+  await sleepMs(150);
+  if (!menuAlive()) throw new Error('Esc 后未驻留：菜单窗被立即关闭');
+  if (!await waitForTabMenuReady(async () => !menuAlive())) throw new Error('Esc 驻留后菜单窗未关闭');
+  const escProbes = await readTabMenuProbes();
+  if (!escProbes.length || escProbes[0].cancelled !== true) throw new Error(`Esc 回执不是 cancelled：${JSON.stringify(escProbes)}`);
+  health.escDwell = 'pass';
+
+  // ③ 驻留期内再次呼出＝取消消失、原地换内容：首个会话回执 cancelled，新菜单条目可点选
+  await invokeTabMenuFromCreator([{ id: 'pin', label: '固定标签' }]);
+  await waitForTabMenuItems();
+  await tabMenuWindow.webContents.executeJavaScript(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))`);
+  await sleepMs(100);
+  await invokeTabMenuFromCreator([{ id: 'close', label: '关闭标签' }]);
+  await waitForTabMenuItems();
+  await tabMenuWindow.webContents.executeJavaScript(`document.querySelector('[data-action="close"]')?.click()`);
+  if (!await waitForTabMenuReady(async () => {
+    const probes = await readTabMenuProbes();
+    return probes.length >= 2 && probes[0].cancelled === true && probes[1] && probes[1].action === 'close';
+  })) {
+    throw new Error(`重呼会话回执异常：${JSON.stringify(await readTabMenuProbes())}`);
+  }
+  health.recallDuringDwell = 'pass';
+
+  // ④ blur 驻留：点击窗口外（blur）不立即消失，500ms 后回执 cancelled（与 Esc 同一条驻留路径）
+  await invokeTabMenuFromCreator([{ id: 'pin', label: '固定标签' }]);
+  await waitForTabMenuItems();
+  tabMenuWindow.emit('blur');
+  await sleepMs(150);
+  if (!menuAlive()) throw new Error('blur 后未驻留：菜单窗被立即关闭');
+  if (!await waitForTabMenuReady(async () => !menuAlive())) throw new Error('blur 驻留后菜单窗未关闭');
+  const blurProbes = await readTabMenuProbes();
+  if (!blurProbes.length || blurProbes[0].cancelled !== true) throw new Error(`blur 回执不是 cancelled：${JSON.stringify(blurProbes)}`);
+  health.blurDwell = 'pass';
+
+  // ⑤ 边缘坐标钳制：请求点远超屏幕时菜单必须被拉回 workArea 内且仍可点选
+  await invokeTabMenuFromCreator([{ id: 'restore', label: '重新打开关闭的标签', accelerator: 'CmdOrCtrl+Shift+T' }], 4000, 2400);
+  items = await waitForTabMenuItems();
+  const edgeBounds = tabMenuWindow.getBounds();
+  const edgeArea = screen.getDisplayNearestPoint({ x: edgeBounds.x, y: edgeBounds.y }).workArea;
+  if (edgeBounds.x < edgeArea.x || edgeBounds.y < edgeArea.y
+    || edgeBounds.x + edgeBounds.width > edgeArea.x + edgeArea.width + 1
+    || edgeBounds.y + edgeBounds.height > edgeArea.y + edgeArea.height + 1) {
+    throw new Error(`边缘请求未被钳制进可用区：${JSON.stringify({ edgeBounds, edgeArea })}`);
+  }
+  await tabMenuWindow.webContents.executeJavaScript(`document.querySelector('[data-action="restore"]')?.click()`);
+  if (!await waitForTabMenuReady(async () => (await readTabMenuProbes()).some(r => r && r.action === 'restore'))) {
+    throw new Error('钳制后的菜单点选无回执');
+  }
+  health.edgeClamp = 'pass';
+
+  console.log(`TAB_MENU_IPC_PASS ${JSON.stringify(health)}`);
+  app.quit();
+}
+
+// —— 单视频置顶浮窗（创作浏览器左栏右键 → 浮到最顶层 → 从浮窗原生拖进剪映）——
+// 独立单视频窗口，沿用 requireTrusted + requireCreativeAsset + webContents.startDrag 安全边界。
+// 硬约束：① 只允许当前剧本里的真实视频文件（图片/音频/文档/任意路径一律拒绝）；
+// ② 全应用只保留一个浮窗——同文件重复请求只置前，换文件先关旧窗再开新窗；
+// ③ 浮窗只读展示与拖出，绝不复制、移动或删除素材文件；× 关闭只关窗；
+// ④ 浮窗关闭（含 Cmd/Ctrl+W 等系统关闭、剧本切换、换文件、工作区退出）都向 creator 窗口
+//    回发 creator:float-video-closed {path}，由左栏还原对应卡片状态；
+// ⑤ 每次读取信息与每次拖出都按「当前剧本」重新校验：切剧本后旧剧本文件既不能再显示也不能拖出。
+const FLOAT_VIDEO_SIZE = Object.freeze({ width: 384, height: 336, minWidth: 300, minHeight: 240 });
+let floatVideoWindow = null;
+// { path, projectId, absolutePath, size }：浮窗当前唯一允许显示/拖出的视频，换窗即重建。
+let floatVideoState = null;
+
+function floatVideoBoundsFile() {
+  return path.join(process.env.VIDEO_OS_DATA_DIR || app.getPath('temp'), 'float-video-bounds.json');
+}
+
+// 位置钳制在最近显示器可用区内：记忆或兜底拖拽都可能把浮窗留在外接屏外，重启后找不回来。
+function clampFloatVideoBounds(bounds) {
+  const width = Math.max(FLOAT_VIDEO_SIZE.minWidth, Math.min(Number(bounds.width) || FLOAT_VIDEO_SIZE.width, 760));
+  const height = Math.max(FLOAT_VIDEO_SIZE.minHeight, Math.min(Number(bounds.height) || FLOAT_VIDEO_SIZE.height, 900));
+  try {
+    const area = screen.getDisplayNearestPoint({ x: Math.round(bounds.x) || 0, y: Math.round(bounds.y) || 0 }).workArea;
+    const x = Math.max(area.x - width + 120, Math.min(Number(bounds.x) || 0, area.x + area.width - 120));
+    const y = Math.max(area.y, Math.min(Number(bounds.y) || 0, area.y + area.height - 40));
+    return { ...bounds, x: Math.round(x), y: Math.round(y), width: Math.round(width), height: Math.round(height) };
+  } catch {
+    return { ...bounds, width: Math.round(width), height: Math.round(height) };
+  }
+}
+
+function defaultFloatVideoBounds() {
+  let area = null;
+  try {
+    const display = creatorWindow && !creatorWindow.isDestroyed()
+      ? screen.getDisplayMatching(creatorWindow.getBounds())
+      : screen.getPrimaryDisplay();
+    area = display.workArea;
+  } catch {
+    area = { x: 0, y: 0, width: 1440, height: 900 };
+  }
+  return clampFloatVideoBounds({
+    x: Math.round(area.x + (area.width - FLOAT_VIDEO_SIZE.width) / 2),
+    y: Math.round(area.y + (area.height - FLOAT_VIDEO_SIZE.height) / 2),
+    width: FLOAT_VIDEO_SIZE.width,
+    height: FLOAT_VIDEO_SIZE.height,
+  });
+}
+
+// 视频/当前剧本的双重门禁：必须落在当前激活剧本目录内、解析为创作资产库里的真实普通文件，
+// 且 classify 为 video —— 图片、音频、文档、越界路径、符号链接、成片库外的一切都在此被拒。
+function requireFloatVideoAsset(relativePath) {
+  const requested = String(relativePath || '').replace(/\\/g, '/');
+  if (!requested) throw new Error('缺少视频路径');
+  const { absolutePath } = requireCreativeAsset(requested, 'video');
+  let stat;
+  try {
+    stat = fs.statSync(absolutePath);
+  } catch {
+    throw new Error('视频文件已不存在');
+  }
+  if (!stat.isFile()) throw new Error('只能浮出创作资产库内的真实视频文件');
+  if (stat.size > 20 * 1024 * 1024 * 1024) throw new Error('视频超过 20 GB，拒绝直接拖拽');
+  return { path: requested, absolutePath, size: stat.size };
+}
+
+// 渲染层只拿到相对路径 + 同名文件的本地预览地址（同源 /api/creative-assets/file，受信任 UI 校验），
+// 不暴露绝对路径；预览地址里的 project 参数始终是「当前」剧本 id。
+function floatVideoPublicInfo(asset) {
+  const project = creativeProjectStore.active();
+  const rel = String(asset && asset.path || '');
+  if (!project || !rel || !localServerInfo) throw new Error('浮窗已关闭');
+  return {
+    path: rel,
+    name: path.basename(rel),
+    kind: 'video',
+    projectId: project.id,
+    projectName: project.name || '',
+    size: Number(asset.size) || 0,
+    disposition: VideoDisposition.of({ path: rel, ...serverModule.assetWorkflowInfo(project, rel) }),
+    presentation: floatVideoWindow?.__floatVideoRecord?.presentation?.render || null,
+    fileUrl: `${localServerInfo.url}/api/creative-assets/file?project=${encodeURIComponent(project.id)}&p=${encodeURIComponent(rel)}`,
+  };
+}
+
+function notifyFloatVideoClosed(record, reason) {
+  // 每次浮出只还原一次：拖出收起后，后续销毁隐藏窗口不能重复通知左栏。
+  if (!record || !record.info || record.notified) return;
+  record.notified = true;
+  sendCreator('creator:float-video-closed', { ...record.info, reason: reason || record.reason || 'closed' });
+}
+
+function dismissFloatVideoAfterDrag(win) {
+  if (!win || win.isDestroyed() || win !== floatVideoWindow) return;
+  // macOS startDrag 返回时原生拖拽会话仍在进行。只隐藏，不销毁拖拽源；
+  // 单例留作下次右键复用，换视频/切剧本/退出时仍按原来的路径销毁。
+  try {
+    win.hide();
+    notifyFloatVideoClosed(win.__floatVideoRecord, 'dragged');
+  } catch (error) {
+    logDiagnostic('float-video-dismiss-after-drag', error);
+  }
+}
+
+// macOS 的 setVisibleOnAllWorkspaces 会改掉窗口级别，floating 置顶必须写在它后面。
+// 只在创建和首次显示时调用：重复调用会把进程标成无 Dock 图标，同文件置前不再走这里。
+function pinFloatVideoWindow(win) {
+  if (!win || win.isDestroyed()) return;
+  if (process.platform === 'darwin') {
+    try { win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); }
+    catch (error) { logDiagnostic('float-video-workspace', error); }
+  }
+  win.setAlwaysOnTop(true, 'floating');
+}
+
+function bringFloatVideoForward() {
+  const win = floatVideoWindow;
+  if (!win || win.isDestroyed()) return;
+  try {
+    // moveTop 对已置顶窗偶尔不生效；重设一次级别保证「浮到屏幕最顶层」。
+    win.setAlwaysOnTop(true, 'floating');
+    if (!win.isVisible()) win.showInactive();
+    win.moveTop();
+  } catch (error) {
+    logDiagnostic('float-video-front', error);
+  }
+}
+
+// 先摘全局引用再 close：换文件时旧的 closed 通知一定要发出，且不能被新窗口的引用比较吞掉。
+function closeFloatVideoWindow(reason = 'closed') {
+  const win = floatVideoWindow;
+  floatVideoWindow = null;
+  floatVideoState = null;
+  if (!win || win.isDestroyed()) return false;
+  if (win.__floatVideoRecord) win.__floatVideoRecord.reason = reason;
+  try {
+    win.close();
+  } catch (error) {
+    logDiagnostic('float-video-close', error);
+    notifyFloatVideoClosed(win.__floatVideoRecord, reason);
+  }
+  return true;
+}
+
+function floatVideoSourceRect(payload) {
+  const raw = payload?.origin;
+  if (!raw || !creatorWindow || creatorWindow.isDestroyed()) return null;
+  if (!['x', 'y', 'width', 'height'].every(key => Number.isFinite(raw[key]))) return null;
+  const owner = creatorWindow.getContentBounds(), zoom = creatorWindow.webContents.getZoomFactor();
+  const x = Math.max(0, raw.x * zoom), y = Math.max(0, raw.y * zoom);
+  const width = Math.min(raw.width * zoom, owner.width - x), height = Math.min(raw.height * zoom, owner.height - y);
+  if (width < 1 || height < 1) return null;
+  return { x: Math.round(owner.x + x), y: Math.round(owner.y + y), width: Math.round(width), height: Math.round(height) };
+}
+
+function settleFloatVideoPresentation(win, id) {
+  const record = win?.__floatVideoRecord, presentation = record?.presentation;
+  if (!win || win.isDestroyed() || !presentation || (id && id !== presentation.render.id)) return;
+  clearTimeout(record.presentationTimer);
+  record.presentation = null;
+  win.setBounds(presentation.target, false);
+  win.setMaximumSize(760, 900);
+  if (!win.webContents.isDestroyed()) win.webContents.send('float-video:settled', { id: presentation.render.id });
+}
+
+function createFloatVideoWindow(asset, payload) {
+  if (!localServerInfo) throw new Error('本地服务尚未就绪');
+  const project = creativeProjectStore.active();
+  let saved = {};
+  try { saved = JSON.parse(fs.readFileSync(floatVideoBoundsFile(), 'utf-8')); } catch {}
+  const bounds = Number.isFinite(saved.x) && Number.isFinite(saved.y)
+    ? clampFloatVideoBounds({ x: saved.x, y: saved.y, width: saved.width, height: saved.height })
+    : defaultFloatVideoBounds();
+  const presentation = createFloatPresentation(bounds, floatVideoSourceRect(payload), `float-${Date.now()}`);
+  const win = new BrowserWindow({
+    ...presentation.bounds,
+    minWidth: FLOAT_VIDEO_SIZE.minWidth, minHeight: FLOAT_VIDEO_SIZE.minHeight,
+    title: '置顶视频浮窗',
+    frame: false, show: false, alwaysOnTop: true, fullscreenable: false,
+    minimizable: false, maximizable: false, skipTaskbar: true,
+    transparent: true, backgroundColor: '#00000000', hasShadow: false,
+    ...(process.platform === 'darwin' ? { type: 'panel', focusable: false } : {}),
+    webPreferences: {
+      preload: path.join(__dirname, 'float-video-preload.cjs'),
+      nodeIntegration: false, contextIsolation: true, sandbox: true,
+      webSecurity: true, spellcheck: false,
+    },
+  });
+  const record = {
+    info: { path: asset.path, projectId: project ? project.id : '', name: path.basename(asset.path) },
+    reason: 'closed',
+    presentation,
+  };
+  win.__floatVideoRecord = record;
+  floatVideoWindow = win;
+  floatVideoState = { ...asset, projectId: project ? project.id : '' };
+  // macOS：所有桌面空间可见（含全屏 App）。Windows/Linux 没有等价 API，只保留 floating 置顶。
+  pinFloatVideoWindow(win);
+  protectLocalWindow(win);
+  win.webContents.on('preload-error', (_event, preloadPath, error) => logDiagnostic('float-video-preload:' + preloadPath, error));
+  win.webContents.on('render-process-gone', (_event, details) => logDiagnostic('float-video-renderer', JSON.stringify(details)));
+  let saveBoundsTimer = null;
+  const saveBounds = () => {
+    clearTimeout(saveBoundsTimer);
+    saveBoundsTimer = setTimeout(() => {
+      if (win.isDestroyed()) return;
+      if (record.presentation) return;
+      try { fs.writeFileSync(floatVideoBoundsFile(), JSON.stringify(win.getBounds())); } catch {}
+    }, 300);
+  };
+  win.on('moved', saveBounds);
+  win.on('resize', saveBounds);
+  win.on('closed', () => {
+    clearTimeout(saveBoundsTimer);
+    clearTimeout(record.presentationTimer);
+    if (floatVideoWindow === win) {
+      floatVideoWindow = null;
+      floatVideoState = null;
+    }
+    notifyFloatVideoClosed(record, record.reason);
+  });
+  win.loadURL(`${localServerInfo.url}/float-video.html`).catch(error => logDiagnostic('float-video-load', error));
+  win.once('ready-to-show', () => {
+    // 显示后再钉一次：macOS 可能在 show 时丢掉「所有空间可见」或 floating 级别。
+    // 不抢创作面板焦点：右键时左栏可能正在做内联编辑，showInactive 与联动窗同一策略。
+    if (win.isDestroyed() || !record.presentation || record.presented) return;
+    // 渲染层先摆在来源卡片的位置，绘制完成后再显示并播放，避免暗框闪一下。
+    record.presentationTimer = setTimeout(() => {
+      if (win.isDestroyed() || win !== floatVideoWindow) return;
+      settleFloatVideoPresentation(win);
+      bringFloatVideoForward();
+    }, 2000);
+  });
+  return win;
+}
+
+// 打开（或置前）单视频浮窗：一次只保留一个窗，换文件先关旧再开新。
+function openFloatVideoWindow(payload) {
+  if (!localServerInfo) throw new Error('本地服务尚未就绪');
+  const requested = typeof payload === 'string' ? payload : (payload && payload.path);
+  const asset = requireFloatVideoAsset(requested);
+  const project = creativeProjectStore.active();
+  if (floatVideoWindow && !floatVideoWindow.isDestroyed()) {
+    const sameFile = floatVideoState
+      && floatVideoState.path === asset.path
+      && floatVideoState.projectId === (project ? project.id : '');
+    if (sameFile) {
+      // 已拖出收起的窗口再次浮出，开启新一轮关闭/还原通知。
+      if (floatVideoWindow.__floatVideoRecord) floatVideoWindow.__floatVideoRecord.notified = false;
+      if (!floatVideoWindow.isVisible()) {
+        const win = floatVideoWindow, record = win.__floatVideoRecord;
+        settleFloatVideoPresentation(win);
+        record.presentation = createFloatPresentation(clampFloatVideoBounds(win.getBounds()), floatVideoSourceRect(payload), `float-${Date.now()}`);
+        record.presented = false;
+        win.setMaximumSize(12000, 12000);
+        win.setBounds(record.presentation.bounds, false);
+        win.webContents.send('float-video:prepare', record.presentation.render);
+        record.presentationTimer = setTimeout(() => { if (!win.isDestroyed()) { settleFloatVideoPresentation(win); bringFloatVideoForward(); } }, 2000);
+      } else bringFloatVideoForward();
+      return { ok: true, path: asset.path, reused: true };
+    }
+    // 换文件：旧窗关闭会通知 creator 还原旧卡片，随后左栏只保留新卡片处于浮窗态。
+    closeFloatVideoWindow('replaced');
+  } else {
+    floatVideoWindow = null;
+    floatVideoState = null;
+  }
+  createFloatVideoWindow(asset, payload);
+  return { ok: true, path: asset.path, reused: false };
+}
+
+function registerIpc() {
+  ipcMain.on('creator:selected-file-read', authorizeSelectedCreatorFileRead);
+  downloadReviewUI = createDownloadReviewUI({ BrowserWindow, ipcMain,
+    parent: () => creatorWindow, url: () => `${localServerInfo.url}/assets/ui/download-review.html`,
+    preload: path.join(__dirname, 'download-review-preload.cjs'),
+    onError: error => logDiagnostic('video-download-choice', error),
+  });
+  ipcMain.handle('asset:folder-menu', async (event, payload = {}) => {
+    if (!isTrustedCreatorSender(event) && !isTrustedAssetSender(event)) throw new Error('拒绝未经授权的文件夹操作');
+    const owner = creatorWindow;
+    const project = creativeProjectStore.active();
+    const relative = String(payload.path || '').replace(/\\/g, '/');
+    if (!project || (relative !== project.folder && !relative.startsWith(`${project.folder}/`))) throw new Error('请选择当前剧本内的文件夹');
+    const isProjectRoot = relative === project.folder;
+    const entry = resolveCreativeAsset(CREATIVE_ASSET_DIR, relative, 'folder');
+    if (!entry || !owner || owner.isDestroyed()) throw new Error('文件夹不存在');
+    const zoom = event.sender.getZoomFactor();
+    const bounds = isTrustedAssetSender(event) ? assetView.getBounds() : { x: 0, y: 0 };
+    const chosen = await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = value => { if (settled) return; settled = true; owner.removeListener('closed', onClosed); resolve(value); };
+      const onClosed = () => finish(null);
+      owner.once('closed', onClosed);
+      try {
+        Menu.buildFromTemplate([
+          { label: isProjectRoot ? '新建文件夹…' : '新建子文件夹…', click: () => finish('create') },
+          ...(!isProjectRoot ? [
+          { label: '改名…', enabled: relative !== project.categories.find(item => item.id === 'browser-downloads')?.path, click: () => finish('rename') },
+          ] : []),
+          { label: '在文件夹中显示', click: () => finish('reveal') },
+          ...(!isProjectRoot ? [
+          { type: 'separator' },
+          { label: `删除文件夹「${path.basename(entry.abs)}」…`, click: () => finish('delete') },
+          ] : []),
+        ]).popup({ window: owner,
+          x: Math.max(0, Math.round((Number(payload.x) || 0) * zoom + bounds.x)),
+          y: Math.max(0, Math.round((Number(payload.y) || 0) * zoom + bounds.y)),
+          callback: () => setImmediate(() => finish(null)),
+        });
+      } catch (error) { owner.removeListener('closed', onClosed); reject(error); }
+    });
+    if (!chosen || owner.isDestroyed()) return { cancelled: true };
+    if (creativeProjectStore.active()?.id !== project.id) throw new Error('剧本已切换，请重新选择文件夹');
+    if (chosen === 'create') return { create: true, parent: relative, projectId: project.id };
+    if (chosen === 'reveal') { shell.showItemInFolder(entry.abs); return { revealed: true }; }
+    if (chosen === 'rename') return { rename: true, path: relative, name: path.basename(entry.abs), projectId: project.id };
+    const { response } = await dialog.showMessageBox(owner, {
+      type: 'warning', title: '删除文件夹', message: `删除「${path.basename(entry.abs)}」及其中的全部内容？`,
+      detail: '文件夹将移入系统废纸篓。删除后，资产列表和数量会同步更新；可以从废纸篓恢复。',
+      buttons: ['取消', '删除文件夹'], defaultId: 0, cancelId: 0, noLink: true,
+    });
+    if (response !== 1 || owner.isDestroyed()) return { cancelled: true };
+    if (creativeProjectStore.active()?.id !== project.id) throw new Error('剧本已切换，未删除原文件夹');
+    const current = resolveCreativeAsset(CREATIVE_ASSET_DIR, relative, 'folder');
+    if (!current || current.abs !== entry.abs) throw new Error('文件夹已变更，未执行删除');
+    const videoRoot = project.categories.find(item => item.id === 'generated-videos')?.path;
+    const containsActiveDownload = [...activeDownloadItems.values()].some(({ record }) =>
+      (record.savePath && pathIsInside(entry.abs, record.savePath)) ||
+      (record.pendingReview && record.productionSnapshot?.projectId === project.id && (relative === videoRoot || relative.startsWith(`${videoRoot}/`))));
+    if (containsActiveDownload) throw new Error('这个文件夹仍有下载任务，请完成或取消后再删除');
+    const result = await creativeProjectStore.deleteFolder(project.id, relative, absolute => shell.trashItem(absolute));
+    if (floatVideoState?.path.startsWith(`${relative}/`)) closeFloatVideoWindow('folder-deleted');
+    serverModule.broadcastCreativeAssets?.();
+    return { ...result, deleted: true };
+  });
+  ipcMain.handle('asset:rename-folder', (event, payload = {}) => {
+    if (!isTrustedCreatorSender(event) && !isTrustedAssetSender(event)) throw new Error('拒绝未经授权的文件夹操作');
+    const project = creativeProjectStore.active();
+    if (!project || project.id !== payload.projectId) throw new Error('剧本已切换，请重新选择文件夹');
+    const relative = String(payload.path || '');
+    if (!relative.startsWith(`${project.folder}/`)) throw new Error('只能修改当前剧本内的文件夹');
+    const entry = resolveCreativeAsset(CREATIVE_ASSET_DIR, relative, 'folder');
+    if (!entry) throw new Error('文件夹不存在');
+    const videos = project.categories.find(item => item.id === 'generated-videos')?.path;
+    if ([...activeDownloadItems.values()].some(({ record }) => {
+      const pendingFolder = record.episodeSnapshot && videos
+        ? `${videos}/${currentEpisodePlatform(record.episodeSnapshot)}/${episodeLabel(record.episodeSnapshot.episode)}` : '';
+      return (record.savePath && pathIsInside(entry.abs, record.savePath)) ||
+        (record.pendingReview && record.productionSnapshot?.projectId === project.id
+          && (relative === videos || (pendingFolder && (pendingFolder === relative || pendingFolder.startsWith(`${relative}/`)))));
+    })) {
+      throw new Error('这个文件夹仍有下载任务，请完成或取消后再改名');
+    }
+    const result = serverModule.renameCreativeFolder(project.id, relative, payload.name);
+    const target = path.join(CREATIVE_ASSET_DIR, ...result.path.split('/'));
+    for (const record of recentDownloads) {
+      if (record.savePath && pathIsInside(entry.abs, record.savePath)) {
+        record.savePath = path.join(target, path.relative(entry.abs, record.savePath));
+        broadcastDownload(record);
+      }
+    }
+    if (floatVideoState?.path.startsWith(`${relative}/`)) closeFloatVideoWindow('folder-renamed');
+    serverModule.broadcastCreativeAssets?.({ folderRename: result });
+    return result;
+  });
+  ipcMain.handle('creator:automation', (event, request = {}) => {
+    requireTrusted(event, 'media');
+    if (!creatorAutomation) throw new Error('自动化接口正在启动');
+    return creatorAutomation.call(request.name, request.arguments || {});
+  });
+  ipcMain.handle('os:open-creator', async (event, request) => {
+    requireTrusted(event, 'main');
+    return createCreatorWindow(request);
+  });
+
+  ipcMain.handle('os:add-media-source', async (event, kind) => {
+    requireTrusted(event, 'main');
+    if (!mediaSourceStore) throw new Error('媒体索引服务尚未就绪');
+    const requestedKind = kind === 'downloads' ? 'downloads' : 'folder';
+    let rootPath = '';
+    if (requestedKind === 'downloads') {
+      rootPath = app.getPath('downloads');
+    } else {
+      const selection = await dialog.showOpenDialog(mainWindow, {
+        title: '选择要关联的图片、音频或视频文件夹',
+        buttonLabel: '添加到媒体索引',
+        properties: ['openDirectory', 'dontAddToRecent'],
+      });
+      if (selection.canceled || !selection.filePaths[0]) return { cancelled: true };
+      rootPath = selection.filePaths[0];
+    }
+    const baseLabel = requestedKind === 'downloads' ? 'Downloads' : (path.basename(rootPath) || '媒体目录');
+    const existingLabels = new Set(mediaSourceStore.list({ downloadsPath: app.getPath('downloads') })
+      .map(source => source.label.toLocaleLowerCase('zh-CN')));
+    let label = baseLabel;
+    for (let suffix = 2; existingLabels.has(label.toLocaleLowerCase('zh-CN')); suffix++) {
+      label = `${baseLabel} ${suffix}`;
+    }
+    const source = mediaSourceStore.addDirectory({ label, rootPath, kind: requestedKind });
+    serverModule.mediaSourceWatcher?.refresh();
+    serverModule.broadcastRescan?.();
+    return source;
+  });
+
+  ipcMain.handle('os:remove-media-source', async (event, sourceId) => {
+    requireTrusted(event, 'main');
+    if (!mediaSourceStore) throw new Error('媒体索引服务尚未就绪');
+    await serverModule.prepareMediaSourceRemoval?.();
+    const source = mediaSourceStore.remove(String(sourceId || ''));
+    serverModule.mediaSourceWatcher?.refresh();
+    serverModule.broadcastRescan?.();
+    return source;
+  });
+
+  ipcMain.handle('creator:get-config', event => {
+    requireTrusted(event, 'creator');
+    return {
+      services: publicServices(),
+      candidate: CANDIDATE_MODE ? { id: RUNTIME_CONFIG.candidateId, version: RUNTIME_CONFIG.candidateVersion } : null,
+      modeServices: publicModeServices(),
+      defaults: publicDefaults(),
+      hiddenBuiltinIds: creatorPlatformStore.hiddenBuiltinIds(),
+      paths: creatorPaths(),
+      project: creativeProjectStore.active(),
+      assetPanel: publicAssetPanelState(),
+      nativeQuickAssetDrag: true,
+      browser: browserState(),
+      downloadEpisodes: publicDownloadEpisodes(),
+      testMode: TEST_MODE,
+    };
+  });
+
+  ipcMain.handle('creator:get-download-episodes', event => {
+    requireTrusted(event, 'creator');
+    return publicDownloadEpisodes();
+  });
+
+  ipcMain.handle('creator:advance-download-episode', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    const project = creativeProjectStore.active();
+    if (!project?.available || String(payload.projectId || '') !== project.id) throw new Error('当前剧本已切换，请重试下一集');
+    const serviceId = String(payload.serviceId || ''), kind = String(payload.kind || '');
+    const service = serviceById(serviceId);
+    if (!service || !MEDIA_KINDS.has(kind)) throw new Error('下载所属网站或媒体类型无效');
+    const category = creativeProjectStore.category(project.id, DOWNLOAD_EPISODE_CATEGORIES[kind]);
+    const directoryFor = snapshot => path.join(category.absolutePath, snapshot.platformFolder, episodeLabel(snapshot.episode));
+    const result = downloadEpisodeStore.advance({ projectId: project.id, serviceId, kind,
+      serviceLabel: service.label, expectedEpisode: payload.expectedEpisode }, {
+      create(snapshot) { ensureArchiveDirectory(category.absolutePath, directoryFor(snapshot)); },
+    });
+    const states = sendDownloadEpisodes(project);
+    if (result.advanced) serverModule.broadcastCreativeAssets?.();
+    return { ...states, advanced: result.advanced, state: result.state };
+  });
+
+  ipcMain.handle('creator:add-custom-service', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('网站信息格式无效');
+    const requestedName = String(payload.name || '').normalize('NFC').trim().toLowerCase();
+    const requestedUrl = normalizeBrowserAddress(payload.url);
+    if (Object.values(SERVICES).some(service => service.label.toLowerCase() === requestedName
+      || service.imageLabel?.toLowerCase() === requestedName || service.videoLabel?.toLowerCase() === requestedName)) {
+      throw new Error('该名称已被内置平台使用');
+    }
+    if (Object.values(SERVICES).some(service => normalizeBrowserAddress(service.url) === requestedUrl)) {
+      throw new Error('该网址已是内置平台');
+    }
+    return creatorPlatformStore.add({ name: payload.name, url: requestedUrl });
+  });
+
+  ipcMain.handle('creator:remove-custom-service', (event, serviceId) => {
+    requireTrusted(event, 'creator');
+    return removeCustomService(String(serviceId || ''));
+  });
+
+  ipcMain.handle('creator:rename-service', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    const result = creatorPlatformStore.rename(String(payload.serviceId || ''), payload.name);
+    pushBrowserState();
+    return result;
+  });
+
+  ipcMain.handle('creator:rename-tab', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    const tab = tabById(payload.tabId);
+    if (!tab) throw new Error('这个网页已关闭');
+    const { normalizePlatformName } = require('./creator-platforms.cjs');
+    tab.customName = normalizePlatformName(payload.name);
+    pushBrowserState();
+    return browserState();
+  });
+
+  ipcMain.handle('creator:remove-service', (event, serviceId) => {
+    requireTrusted(event, 'creator');
+    return removeCreatorService(String(serviceId || ''));
+  });
+
+  ipcMain.handle('creator:restore-builtin-service', (event, serviceId) => {
+    requireTrusted(event, 'creator');
+    return creatorPlatformStore.restoreBuiltin(String(serviceId || ''));
+  });
+
+  ipcMain.handle('creator:restore-builtin-services', event => {
+    requireTrusted(event, 'creator');
+    return creatorPlatformStore.restoreBuiltins();
+  });
+
+  ipcMain.handle('creator:set-asset-panel', (event, patch = {}) => {
+    requireTrusted(event, 'creator');
+    return updateAssetPanel(patch);
+  });
+
+  ipcMain.handle('creator:select-service', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    return selectServiceTab(String(payload.serviceId || ''), payload.mode);
+  });
+
+  ipcMain.handle('creator:set-mode', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    return switchBrowserMode(payload.mode, payload.serviceId);
+  });
+
+  ipcMain.handle('creator:open-tab', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    // 多开：同一平台再开一个独立网页（类似浏览器的“复制标签页”），
+    // 指定 afterTabId 时新标签插到源标签旁边，可无限多开并行对话。
+    const sourceTabId = String(payload.afterTabId || '');
+    const newTab = createTab(String(payload.serviceId || ''), payload.mode);
+    if (sourceTabId && browserTabs.has(sourceTabId) && newTab.id !== sourceTabId) {
+      const reordered = new Map();
+      for (const [id, tab] of browserTabs) {
+        reordered.set(id, tab);
+        if (id === sourceTabId) reordered.set(newTab.id, newTab);
+      }
+      browserTabs.clear();
+      for (const [id, tab] of reordered) browserTabs.set(id, tab);
+    }
+    pushBrowserState();
+    return browserState();
+  });
+
+  ipcMain.handle('creator:select-tab', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    return selectTab(String(payload.tabId || ''));
+  });
+
+  ipcMain.handle('creator:reorder-tabs', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    return reorderBrowserTabs(payload);
+  });
+
+  ipcMain.handle('creator:pin-tab', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    return setTabPinned(String(payload.tabId || ''), !!payload.pinned);
+  });
+
+  ipcMain.handle('creator:set-tab-muted', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    return setTabMuted(String(payload.tabId || ''), !!payload.muted);
+  });
+
+  ipcMain.handle('creator:restore-closed-tab', event => {
+    requireTrusted(event, 'creator');
+    return restoreClosedTab();
+  });
+
+  ipcMain.handle('creator:close-other-tabs', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    const scope = ['left', 'right'].includes(payload.scope) ? payload.scope : 'others';
+    return closeOtherTabs(String(payload.tabId || ''), scope);
+  });
+
+  ipcMain.handle('creator:cycle-tab', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    const offset = Number(payload.offset) < 0 ? -1 : 1;
+    return cycleBrowserTab(offset);
+  });
+
+  ipcMain.handle('creator:find-in-page', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    if (!activeView || activeView.webContents.isDestroyed()) throw new Error('没有可查找的网页');
+    const text = String(payload.text || '');
+    if (!text) {
+      activeView.webContents.stopFindInPage('clearSelection');
+      return { matches: 0 };
+    }
+    activeView.webContents.findInPage(text, { forward: payload.forward !== false, findNext: !!payload.findNext });
+    return true;
+  });
+
+  ipcMain.handle('creator:find-stop', (event, keepSelection = false) => {
+    requireTrusted(event, 'creator');
+    if (activeView && !activeView.webContents.isDestroyed()) {
+      activeView.webContents.stopFindInPage(keepSelection ? 'keepSelection' : 'clearSelection');
+    }
+    return true;
+  });
+
+  ipcMain.handle('creator:close-tab', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    return closeTab(String(payload.tabId || ''));
+  });
+
+  ipcMain.handle('creator:clear-tabs', event => {
+    requireTrusted(event, 'creator');
+    return confirmClearBrowserTabs();
+  });
+
+  ipcMain.handle('creator:set-browser-bounds', (event, bounds = {}) => {
+    requireTrusted(event, 'creator');
+    const previous = JSON.stringify(browserBounds);
+    browserBounds = clampBounds(bounds);
+    creatorLayoutReady = true;
+    applyCreatorLayout();
+    if (platformViewsRequestedHidden && previous !== JSON.stringify(browserBounds)) {
+      setPlatformViewHidden(true, true).catch(error => logDiagnostic('platform-backdrop', error));
+    }
+    return browserBounds;
+  });
+
+  ipcMain.handle('creator:set-split-view', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    return setSplitView(payload);
+  });
+
+  ipcMain.handle('creator:set-split-ratio', (event, ratio) => {
+    requireTrusted(event, 'creator');
+    return setSplitRatio(ratio);
+  });
+
+  ipcMain.handle('creator:focus-split-pane', (event, pane) => {
+    requireTrusted(event, 'creator');
+    return focusSplitPaneNow(pane, { programmatic: true });
+  });
+
+  ipcMain.handle('creator:navigate', (event, action) => {
+    requireTrusted(event, 'creator');
+    if (!activeView || !ALLOWED_NAV_ACTIONS.has(action)) return false;
+    dismissAssetOverlay();
+    const contents = activeView.webContents;
+    if (action === 'back' && contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
+    else if (action === 'forward' && contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
+    else if (action === 'reload') contents.reload();
+    else if (action === 'hard-reload') contents.reloadIgnoringCache();
+    else if (action === 'stop') {
+      // 只对“原加载已经超时”的停止给出后续说明；普通页面的停止不误报超时。
+      const stoppedTab = tabById(activeTabId);
+      if (stoppedTab && stoppedTab.loadTimedOut) stoppedTab.pendingStopNotice = true;
+      contents.stop();
+    }
+    else if (action === 'home' && activeServiceId) {
+      const tab = tabById(activeTabId);
+      if (tab) tab.displayLabel = '';
+      tab?.load(serviceUrl(activeServiceId));
+    }
+    else return false;
+    return true;
+  });
+
+  ipcMain.handle('creator:navigate-url', (event, address) => {
+    requireTrusted(event, 'creator');
+    if (!activeView || !activeServiceId) throw new Error('请先选择一个创作平台');
+    const url = normalizeBrowserAddress(address);
+    const activeTab = tabById(activeTabId);
+    if (!activeTab) throw new Error('当前标签不存在');
+    dismissAssetOverlay();
+    const seq = ++activeTab.loadSeq;
+    activeTab.currentUrl = url;
+    persistBrowserSession();
+    // 新导航会让旧加载以 ERR_ABORTED 失败：旧回调按序号识别为“已被替换”，不污染新页面状态。
+    activeTab.pendingStopNotice = false;
+    updateTabDisplayLabel(activeTab, url);
+    activeTab.error = '';
+    activeView.webContents.loadURL(url).catch(rejectError => {
+      if (seq !== activeTab.loadSeq) return;
+      // pendingStopNotice：用户对“已超时”的加载点了停止。
+      // 停止挂起型请求的拒绝码可能是 ERR_FAILED 而非 ERR_ABORTED，
+      // 因此按状态而非错误码判断。
+      if (activeTab.pendingStopNotice) {
+        activeTab.pendingStopNotice = false;
+        activeTab.error = '已停止加载：站点长时间无响应。可重试，或改用系统浏览器打开。';
+      } else if (String(rejectError.message).includes('ERR_ABORTED')) {
+        activeTab.error = '已停止加载。可重试，或改用系统浏览器打开。';
+      } else {
+        activeTab.error = `网页打开失败：${rejectError.message}`;
+      }
+      pushBrowserState();
+    });
+    return browserState();
+  });
+
+  ipcMain.handle('creator:open-external', event => {
+    requireTrusted(event, 'creator');
+    const url = tabById(activeTabId)?.currentUrl || (activeView && activeView.webContents.getURL())
+      || (activeServiceId && serviceById(activeServiceId)?.url)
+      || '';
+    if (!url || !isSafeWebUrl(url) || TEST_MODE) return false;
+    shell.openExternal(url).catch(() => {});
+    return true;
+  });
+
+  ipcMain.handle('creator:open-folder', async (event, kind) => {
+    requireTrusted(event, 'creator');
+    const paths = creatorPaths();
+    const target = kind === 'image' ? paths.imageRoot : paths.materialRoot;
+    if (!target) throw new Error('对应文件夹尚未连接');
+    fs.mkdirSync(target, { recursive: true });
+    const error = await shell.openPath(target);
+    if (error) throw new Error(error);
+    return true;
+  });
+
+  ipcMain.handle('creator:import-files', async (event, mode) => {
+    requireTrusted(event, 'creator');
+    return importExternalDownloads(mode);
+  });
+
+  ipcMain.handle('creator:import-assets', async event => {
+    requireTrusted(event, 'creator');
+    return importLocalCreativeAssets();
+  });
+
+  ipcMain.handle('creator:import-dropped-assets', async (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('拖拽素材信息无效');
+    return importDroppedCreativeAssets(payload);
+  });
+
+  ipcMain.handle('creator:copy-creative-asset', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    // 复制当前剧本的参考图到剪贴板，便于直接粘贴到 GPT 等平台上传。
+    const { absolutePath } = requireCreativeAsset(String(payload.path || ''), 'image');
+    if (fs.statSync(absolutePath).size > 100 * 1024 * 1024) throw new Error('图片超过 100 MB，无法复制到剪贴板');
+    const image = nativeImage.createFromPath(absolutePath);
+    if (image.isEmpty()) throw new Error('当前图片格式无法复制');
+    clipboard.writeImage(image);
+    return true;
+  });
+
+  ipcMain.handle('creator:delete-creative-asset', async (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    // 创作浏览器左栏快格删除：与资产库一致，移入系统废纸篓可随时恢复。
+    const { absolutePath } = requireCreativeAsset(String(payload.path || ''));
+    const stat = fs.lstatSync(absolutePath);
+    if (!stat.isFile()) throw new Error('只能删除文件资产');
+    await shell.trashItem(absolutePath);
+    serverModule.broadcastCreativeAssets?.();
+    return true;
+  });
+
+  ipcMain.handle('creator:delete-browser-download', async (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    requireCreativeAsset(String(payload.path || ''));
+    const removedPath = await deleteBrowserDownloadFile({
+      libraryRoot: CREATIVE_ASSET_DIR,
+      downloadsRoot: creatorPaths().downloadRoot,
+      relativePath: String(payload.path || ''),
+    });
+    for (let index = recentDownloads.length - 1; index >= 0; index--) {
+      if (recentDownloads[index].savePath === removedPath) recentDownloads.splice(index, 1);
+    }
+    serverModule.broadcastCreativeAssets?.();
+    return true;
+  });
+
+  ipcMain.handle('creator:page-zoom', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    // 当前网页缩放：in / out / reset，与标准浏览器一致（步进 0.5，范围 ±3）。
+    if (!activeView || activeView.webContents.isDestroyed()) return false;
+    const contents = activeView.webContents;
+    const action = String(payload.action || '');
+    if (action === 'in') contents.setZoomLevel(Math.min(3, contents.getZoomLevel() + 0.5));
+    else if (action === 'out') contents.setZoomLevel(Math.max(-3, contents.getZoomLevel() - 0.5));
+    else if (action === 'reset') contents.setZoomLevel(0);
+    else return false;
+    return true;
+  });
+
+  ipcMain.handle('creator:set-platform-view-hidden', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    // 模态对话框是 HTML 层，而平台网页/资产浮层是原生视图（永远在 HTML 之上）：
+    // 对话框打开期间临时隐藏原生视图，关闭后恢复，否则对话框会被盖住无法操作。
+    return setPlatformViewHidden(!!payload.hidden);
+  });
+
+  ipcMain.handle('creator:open-download', async (event, downloadId) => {
+    requireTrusted(event, 'creator');
+    const id = String(downloadId || '');
+    if (recentDownloads.find(record => record.id === id)?.pendingReview) return false;
+    let savePath = recentDownloads.find(item => item.id === id)?.savePath || '';
+    if (!savePath && productionStore) {
+      const row = productionStore.listInbox({ limit: 200, includeDismissed: true })
+        .find(item => item.download_key === id);
+      savePath = row?.asset_path || '';
+    }
+    savePath = allowedDownloadRevealPath(savePath);
+    if (!savePath) return false;
+    shell.showItemInFolder(savePath);
+    return true;
+  });
+
+  ipcMain.handle('creator:show-creative-asset', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    const { absolutePath } = requireCreativeAsset(String(payload.path || ''));
+    if (!allowedDownloadRevealPath(absolutePath)) return false;
+    shell.showItemInFolder(absolutePath);
+    return true;
+  });
+
+  ipcMain.handle('creator:download-action', async (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    const action = String(payload.action || '');
+    const transfer = activeDownloadItems.get(String(payload.downloadId || ''));
+    if (transfer?.record.pendingReview && (!transfer.item || transfer.finished)) {
+      const record = transfer.record;
+      if (record.reviewBusy) return false;
+      record.reviewBusy = true;
+      try {
+        if (action === 'cancel') {
+          downloadReviewUI?.cancel(record.id);
+          await videoDownloadReview.discard(record.id);
+          activeDownloadItems.delete(record.id); record.state = 'cancelled'; record.pendingReview = false; record.savePath = '';
+          broadcastDownload(record); return true;
+        }
+        if (action !== 'resume') return false;
+        const entry = videoDownloadReview.list().find(item => item.id === record.id);
+        const choice = entry?.choice || await chooseVideoDownload(record);
+        if (['editable', 'processing'].includes(choice)) { await finishReviewedVideo(record); return true; }
+        return false;
+      } finally { record.reviewBusy = false; }
+    }
+    const item = transfer?.item;
+    if (!item || !ALLOWED_DOWNLOAD_ACTIONS.has(action)) return false;
+    if (action === 'pause' && !item.isPaused()) item.pause();
+    else if (action === 'resume' && item.canResume()) item.resume();
+    else if (action === 'cancel') item.cancel();
+    else return false;
+    return true;
+  });
+
+  ipcMain.handle('creator:focus-browser', event => {
+    requireTrusted(event, 'creator');
+    if (!activeView) return false;
+    dismissAssetOverlay();
+    activeView.webContents.focus();
+    return true;
+  });
+
+  ipcMain.handle('creator:show-main-window', async event => {
+    requireTrusted(event, 'creator');
+    await createMainWindow();
+    return true;
+  });
+
+  ipcMain.handle('creator:show-project-menu', async (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('剧本菜单参数无效');
+    const owner = creatorWindow;
+    if (!owner || owner.isDestroyed()) return { cancelled: true };
+    const projects = creativeProjectStore.list();
+    const activeProjectId = creativeProjectStore.active()?.id;
+    const mode = modeOrDefault(payload.mode);
+    const zoom = event.sender.getZoomFactor();
+    const [width, height] = owner.getContentSize();
+    const x = Number.isFinite(payload.x) ? Math.max(0, Math.min(width - 1, Math.round(payload.x * zoom))) : 0;
+    const y = Number.isFinite(payload.y) ? Math.max(0, Math.min(height - 1, Math.round(payload.y * zoom))) : 74;
+    const selection = await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = value => {
+        if (settled) return;
+        settled = true;
+        owner.removeListener('closed', onClosed);
+        resolve(value);
+      };
+      const onClosed = () => finish(null);
+      owner.once('closed', onClosed);
+      try {
+        const menu = Menu.buildFromTemplate([
+          { label: '快速切换剧本', enabled: false },
+          { type: 'separator' },
+          ...projects.map(project => ({
+            label: project.name + (project.available === false ? '（目录不可用）' : ''),
+            type: 'radio',
+            checked: project.id === activeProjectId,
+            enabled: project.available !== false,
+            click: () => finish({ projectId: project.id }),
+          })),
+          { type: 'separator' },
+          { label: '新建或管理剧本…', click: () => finish({ manage: true }) },
+        ]);
+        menu.popup({
+          window: owner, x, y,
+          // Let the selected item's click arrive before treating dismissal as cancel.
+          callback: () => setImmediate(() => finish(null)),
+        });
+      } catch (error) {
+        owner.removeListener('closed', onClosed);
+        reject(error);
+      }
+    });
+    if (!selection || owner.isDestroyed()) return { cancelled: true };
+    if (selection.manage) {
+      await createMainWindow(mode);
+      return { manage: true };
+    }
+    if (selection.projectId === creativeProjectStore.active()?.id) {
+      return { ok: true, unchanged: true, project: creativeProjectStore.active() };
+    }
+    // Reuse the existing project transition; keep browser tabs and login sessions alive.
+    return createCreatorWindow({ mode, projectId: selection.projectId });
+  });
+
+  ipcMain.handle('creator:select-project', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('剧本参数无效');
+    const project = creativeProjectStore.list().find(item => item.id === payload.projectId && item.available !== false);
+    if (!project) throw new Error('剧本不存在或目录不可用');
+    return createCreatorWindow({ mode: modeOrDefault(payload.mode), projectId: project.id });
+  });
+
+  // HTML 剧本列表接收逐项右键；真正的上下文菜单仍用原生 Menu，避免被网页视图盖住。
+  // 主进程只返回用户选择的目标，模板由同源存储一次追加提交，不替换草稿或历史。
+  ipcMain.handle('creator:show-project-template-menu', async (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('迁移菜单参数无效');
+    const projects = creativeProjectStore.list();
+    const source = projects.find(item => item.id === payload.sourceProjectId && item.available !== false);
+    if (!source) throw new Error('来源剧本不存在或目录不可用');
+    const targets = projects.filter(item => item.id !== source.id && item.available !== false);
+    const owner = creatorWindow;
+    if (!owner || owner.isDestroyed()) return { cancelled: true };
+    const count = mode => Number.isSafeInteger(payload.counts?.[mode]) && payload.counts[mode] >= 0 ? payload.counts[mode] : 0;
+    const zoom = event.sender.getZoomFactor(), [width, height] = owner.getContentSize();
+    const x = Number.isFinite(payload.x) ? Math.max(0, Math.min(width - 1, Math.round(payload.x * zoom))) : 0;
+    const y = Number.isFinite(payload.y) ? Math.max(0, Math.min(height - 1, Math.round(payload.y * zoom))) : 74;
+    const selected = await new Promise((resolve, reject) => {
+      let settled = false;
+      const onClosed = () => finish(null);
+      const finish = value => {
+        if (settled) return; settled = true;
+        owner.removeListener('closed', onClosed); resolve(value);
+      };
+      owner.once('closed', onClosed);
+      try {
+        Menu.buildFromTemplate([
+          { label: `「${source.name}」：图片 ${count('image')} 条 · 视频 ${count('video')} 条`, enabled: false },
+          { type: 'separator' },
+          { label: '迁移固定提示词到…', enabled: targets.length > 0 && count('image') + count('video') > 0,
+            submenu: targets.map(target => ({ label: target.name, click: () => finish(target.id) })) },
+        ]).popup({ window: owner, x, y, callback: () => setImmediate(() => finish(null)) });
+      } catch (error) { owner.removeListener('closed', onClosed); reject(error); }
+    });
+    if (!selected || owner.isDestroyed()) return { cancelled: true };
+    const target = creativeProjectStore.list().find(item => item.id === selected && item.available !== false);
+    if (!target) throw new Error('目标剧本已不可用，未执行迁移');
+    return { targetProjectId: target.id, targetName: target.name };
+  });
+
+  ipcMain.handle('creator:show-project-picker', async (event, mode) => {
+    requireTrusted(event, 'creator');
+    await createMainWindow(mode);
+    return true;
+  });
+
+  // 标签右键菜单：原生 Menu.popup 的消失时机由操作系统控制，做不了「消失前驻留 500ms」，
+  // 桌面端使用独立无边框菜单小窗，见 openTabMenuWindow。
+  // 渲染端契约不变：invoke 传 { x, y, items }，返回 { action: '<id>' } 或 { cancelled: true }。
+  ipcMain.handle('creator:show-tab-menu', async (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('标签菜单参数无效');
+    const owner = creatorWindow;
+    if (!owner || owner.isDestroyed()) return { cancelled: true };
+    const zoom = event.sender.getZoomFactor();
+    const [width, height] = owner.getContentSize();
+    const x = Number.isFinite(payload.x) ? Math.max(0, Math.min(width - 1, Math.round(payload.x * zoom))) : 0;
+    const y = Number.isFinite(payload.y) ? Math.max(0, Math.min(height - 1, Math.round(payload.y * zoom))) : 40;
+    const rawItems = Array.isArray(payload.items) ? payload.items.slice(0, 24) : [];
+    const entries = [];
+    for (const raw of rawItems) {
+      if (!raw || typeof raw !== 'object') continue;
+      if (raw.separator) {
+        // 连续分隔线与首尾多余分隔线都收掉，保持菜单干净。
+        if (entries.length && !entries[entries.length - 1].separator) entries.push({ separator: true });
+        continue;
+      }
+      const id = typeof raw.id === 'string' ? raw.id : '';
+      const label = typeof raw.label === 'string' ? raw.label.slice(0, 60) : '';
+      if (!ALLOWED_TAB_MENU_ACTIONS.has(id) || !label) continue;
+      entries.push({
+        separator: false,
+        id,
+        label,
+        enabled: raw.enabled !== false,
+        danger: TAB_MENU_DANGER_ACTIONS.has(id),
+        accelerator: typeof raw.accelerator === 'string' && raw.accelerator.length <= 40 ? raw.accelerator : '',
+      });
+    }
+    while (entries.length && entries[entries.length - 1].separator) entries.pop();
+    if (!entries.some(item => !item.separator)) return { cancelled: true };
+    const action = await openTabMenuWindow({ owner, x, y, entries });
+    if (!action) return { cancelled: true };
+    return { action };
+  });
+
+  ipcMain.handle('creator:get-downloads', event => {
+    requireTrusted(event, 'creator');
+    const activeProjectId = creativeProjectStore.active()?.id || '';
+    return recentDownloads
+      .map(publicDownload)
+      .filter(download => !download.projectId || download.projectId === activeProjectId);
+  });
+
+  ipcMain.handle('asset:get-config', event => {
+    requireTrusted(event, 'asset');
+    ensureCreativeAssetRoot(CREATIVE_ASSET_DIR);
+    return {
+      candidate: CANDIDATE_MODE ? { id: RUNTIME_CONFIG.candidateId, version: RUNTIME_CONFIG.candidateVersion } : null,
+      panel: publicAssetPanelState(),
+      project: creativeProjectStore.active(),
+      rootName: creativeProjectStore.active()?.name || path.basename(CREATIVE_ASSET_DIR),
+      rootPath: creatorPaths().activeProjectRoot,
+      downloadEpisodes: publicDownloadEpisodes(),
+      creativeAssetAvailable: true,
+      obsidianAvailable: !!OBSIDIAN_VAULT,
+    };
+  });
+
+  ipcMain.handle('creator:export-audio', async (event, payload = {}) => {
+    requireTrusted(event, 'media');
+    const asset = requireCreativeAsset(payload.path, 'audio');
+    const result = await dialog.showSaveDialog(BrowserWindow.fromWebContents(event.sender) || creatorWindow || mainWindow, {
+      title: '另存人物音频',
+      defaultPath: path.join(app.getPath('downloads'), path.basename(asset.absolutePath)),
+      filters: [{ name: 'WAV 音频', extensions: ['wav'] }],
+    });
+    if (result.canceled || !result.filePath) return { canceled: true };
+    if (path.resolve(result.filePath) !== path.resolve(asset.absolutePath)) {
+      await fs.promises.copyFile(asset.absolutePath, result.filePath);
+    }
+    return { canceled: false };
+  });
+
+  ipcMain.handle('asset:pick-source-folder', async event => {
+    requireTrusted(event, 'asset');
+    const result = await dialog.showOpenDialog(creatorWindow || mainWindow, {
+      title: '选择外部素材文件夹', properties: ['openDirectory', 'dontAddToRecent'],
+    });
+    return result.canceled ? { cancelled: true } : { path: result.filePaths[0] };
+  });
+
+  ipcMain.handle('asset:set-panel-state', (event, patch = {}) => {
+    requireTrusted(event, 'asset');
+    return updateAssetPanel(patch);
+  });
+
+  const startAssetDrag = (kind, resultChannel) => (event, payload = {}) => {
+    try {
+      requireTrusted(event, kind);
+      // 单文件 {path} 或多文件 {paths:[...按序]}（悬浮窗多选拖拽：Electron files 数组）
+      const requested = Array.isArray(payload?.paths) && payload.paths.length
+        ? payload.paths.map(p => String(p || '').replace(/\\/g, '/'))
+        : [String(payload?.path || '').replace(/\\/g, '/')].filter(Boolean);
+      if (!requested.length) throw new Error('缺少资产路径');
+      if (requested.length > 100) throw new Error('一次最多拖拽 100 个文件');
+      const absolutePaths = requested.map(rel => {
+        const absolutePath = resolveDragAbsolute(rel);
+        if (fs.statSync(absolutePath).size > 20 * 1024 * 1024 * 1024) throw new Error(`${rel} 超过 20 GB，拒绝直接拖拽`);
+        return absolutePath;
+      });
+      const dragItem = absolutePaths.length > 1
+        ? { files: absolutePaths, icon: dragIconFor(absolutePaths[0]) }
+        : { file: absolutePaths[0], icon: dragIconFor(absolutePaths[0]) };
+      event.sender.startDrag(dragItem);
+      if (!event.sender.isDestroyed()) event.sender.send(resultChannel, { ok: true, path: requested[0], count: absolutePaths.length });
+    } catch (error) {
+      if (!event.sender.isDestroyed()) event.sender.send(resultChannel, { ok: false, error: error.message });
+    }
+  };
+  ipcMain.on('asset:start-drag', startAssetDrag('asset', 'asset:drag-result'));
+  ipcMain.on('creator:start-asset-drag', startAssetDrag('creator', 'creator:asset-drag-result'));
+
+  // —— 单视频置顶浮窗 IPC ——
+  // 打开：只信创作浏览器宿主窗口，路径必须是当前剧本里的真实视频文件；成功返回 {path}。
+  ipcMain.handle('creator:float-video', (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    return openFloatVideoWindow(payload);
+  });
+  // 浮窗读取当前视频信息：每次都按当前剧本重新校验，剧本已切换则立即关窗并通知左栏还原。
+  ipcMain.handle('float-video:get-info', event => {
+    requireTrusted(event, 'float');
+    if (!floatVideoState) throw new Error('浮窗已关闭');
+    let asset;
+    try {
+      asset = requireFloatVideoAsset(floatVideoState.path);
+    } catch (error) {
+      closeFloatVideoWindow('stale');
+      throw error;
+    }
+    return floatVideoPublicInfo(asset);
+  });
+  ipcMain.on('float-video:ready', (event, id) => {
+    requireTrusted(event, 'float');
+    const win = floatVideoWindow, record = win?.__floatVideoRecord;
+    if (!record?.presentation || record.presentation.render.id !== id) return;
+    clearTimeout(record.presentationTimer);
+    record.presented = true;
+    pinFloatVideoWindow(win);
+    bringFloatVideoForward();
+    win.webContents.send('float-video:present', { id });
+    // 渲染器失去回执也会自动收敛，包络窗口不会留在屏幕上。
+    record.presentationTimer = setTimeout(() => settleFloatVideoPresentation(win, id), 700);
+  });
+  ipcMain.on('float-video:settle', (event, id) => {
+    requireTrusted(event, 'float');
+    settleFloatVideoPresentation(floatVideoWindow, id);
+  });
+  // 原生拖出：使用 webContents.startDrag；只允许浮窗当前那一个视频，
+  // 且在此刻再校验一次「当前剧本 + 真实视频文件」，杜绝把旧剧本或别的素材拖进剪映。
+  ipcMain.on('float:start-asset-drag', (event, payload = {}) => {
+    const resultChannel = 'float:drag-result';
+    try {
+      requireTrusted(event, 'float');
+      const win = BrowserWindow.fromWebContents(event.sender);
+      if (!win || !win.isVisible()) throw new Error('浮窗已收起，请重新右键浮出视频');
+      const requested = String((payload && payload.path) || payload || '').replace(/\\/g, '/');
+      if (!floatVideoState) throw new Error('浮窗已关闭');
+      if (requested !== floatVideoState.path) throw new Error('浮窗只能拖出当前置顶的视频');
+      const { absolutePath } = requireFloatVideoAsset(requested);
+      settleFloatVideoPresentation(win);
+      event.sender.startDrag({ file: absolutePath, icon: dragIconFor(absolutePath) });
+      if (!event.sender.isDestroyed()) event.sender.send(resultChannel, { ok: true, path: requested, count: 1 });
+      dismissFloatVideoAfterDrag(win);
+    } catch (error) {
+      if (!event.sender.isDestroyed()) event.sender.send(resultChannel, { ok: false, error: error.message });
+    }
+  });
+  // 右上角 ×：只关窗，不删除、不移动、不复制文件；关闭通知由 closed 事件统一发出。
+  ipcMain.on('float:close', event => {
+    requireTrusted(event, 'float');
+    closeFloatVideoWindow('user');
+  });
+  // 标题栏拖动兜底（原生 -webkit-app-region 生效时指针事件不会到达页面），并钳制回屏幕内。
+  ipcMain.on('float:move-window', (event, payload = {}) => {
+    requireTrusted(event, 'float');
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed() || win !== floatVideoWindow) return;
+    settleFloatVideoPresentation(win);
+    const dx = Math.round(Number(payload.dx) || 0);
+    const dy = Math.round(Number(payload.dy) || 0);
+    if (!dx && !dy) return;
+    const [x, y] = win.getPosition();
+    const [width, height] = win.getSize();
+    const next = clampFloatVideoBounds({ x: x + dx, y: y + dy, width, height });
+    win.setPosition(next.x, next.y);
+  });
+
+  ipcMain.handle('asset:copy-image', (event, payload = {}) => {
+    requireTrusted(event, 'asset');
+    const { absolutePath } = requireCreativeAsset(payload.path, 'image');
+    if (fs.statSync(absolutePath).size > 100 * 1024 * 1024) throw new Error('图片超过 100 MB，无法复制到剪贴板');
+    const image = nativeImage.createFromPath(absolutePath);
+    if (image.isEmpty()) throw new Error('当前图片格式无法复制');
+    clipboard.writeImage(image);
+    return true;
+  });
+
+  ipcMain.handle('asset:show-item', (event, payload = {}) => {
+    requireTrusted(event, 'asset');
+    const { absolutePath } = requireCreativeAsset(payload.path);
+    shell.showItemInFolder(absolutePath);
+    return true;
+  });
+
+  // 创作浏览器快捷面板“在完整库中查看”：打开面板并把目标资产送达面板定位。
+  // 送达决策（await 检测就绪期间可能并发导航/重建/换项目/更新目标）：
+  // - 就绪、视图世代未变、项目未变、pending 仍是本请求 → 推送并清空；
+  // - 面板页被 reload/重建（世代变化）或尚未就绪 → 保留 pending，由新文档 boot 的 consume 取走；
+  // - 项目已切换 → 旧目标作废（清空），不得误投新项目；
+  // - pending 为其他值 → superseded；pending 已空 → consume（boot 恰好取走本请求）。
+  // pending 以 {path, projectId, at} 整体记录/比较/清空：path 与发起时项目身份不拆散，
+  // consume 返回完整对象，面板端须再次核对自己就是该 projectId（过期对象带 expired:true，面板实际提示取消），
+  // 旧项目请求不得借相同路径误投。发送异常时保留 pending，等待下次推送或 consume，不静默丢失。
+  // 有界取消：pending 只在 focus/consume 时惰性检查 TTL（无后台定时器）——过期在“下次交互”时
+  // 被丢弃并回执 expired/warn 留痕；面板加载失败期间 pending 保持滞留，属于该边界下的既定行为。
+  // TTL 与检测前的测试门闩均可经环境变量注入，便于隔离测试用确定性时序覆盖过期边界。
+  const FOCUS_TTL_MS = Number.isFinite(Number(process.env.VIDEO_OS_FOCUS_TTL_MS)) && Number(process.env.VIDEO_OS_FOCUS_TTL_MS) > 0
+    ? Number(process.env.VIDEO_OS_FOCUS_TTL_MS) : 30000;
+  const FOCUS_GATE_MS = Number.isFinite(Number(process.env.VIDEO_OS_FOCUS_GATE_MS)) && Number(process.env.VIDEO_OS_FOCUS_GATE_MS) > 0
+    ? Number(process.env.VIDEO_OS_FOCUS_GATE_MS) : 0;
+  const focusExpired = pending => pending && Date.now() - pending.at > FOCUS_TTL_MS;
+  let pendingFocus = null;
+  ipcMain.handle('asset:focus-asset', async (event, payload = {}) => {
+    requireTrusted(event, 'creator');
+    const relativePath = String(payload?.path || '').replace(/\\/g, '/');
+    const requestProjectId = String(payload?.projectId || '');
+    if (!relativePath) return { ok: false, error: '缺少资产路径' };
+    const myGeneration = assetViewGeneration;
+    pendingFocus = { path: relativePath, projectId: requestProjectId, at: Date.now() };
+    // 测试门闩：确定性地让 pending 滞留越过 TTL 边界（生产默认 0 = 无延迟）。
+    try { updateAssetPanel({ open: true }); } catch {}
+    if (FOCUS_GATE_MS > 0) await new Promise(resolve => setTimeout(resolve, FOCUS_GATE_MS));
+    const view = assetView && !assetView.webContents.isDestroyed() ? assetView : null;
+    let ready = false;
+    if (view) {
+      try { ready = await view.webContents.executeJavaScript("document.body?.dataset?.ready === 'true'"); } catch { ready = false; }
+    }
+    const generationStale = assetViewGeneration !== myGeneration;
+    const projectStale = requestProjectId && creativeProjectStore.active()?.id !== requestProjectId;
+    const isSameRequest = pendingFocus && pendingFocus.path === relativePath && pendingFocus.projectId === requestProjectId;
+    if (ready && !generationStale && !projectStale && isSameRequest) {
+      if (focusExpired(pendingFocus)) {
+        pendingFocus = null;
+        console.warn(`[focus] expired dropped before push: ${relativePath}`);
+        return { ok: true, delivered: 'expired' };
+      }
+      pendingFocus = null;
+      try {
+        view.webContents.send('asset:focus-asset', { path: relativePath, projectId: requestProjectId });
+        return { ok: true, delivered: 'push' };
+      } catch (sendError) {
+        pendingFocus = { path: relativePath, projectId: requestProjectId, at: Date.now() };
+        return { ok: false, delivered: 'pending', error: sendError.message };
+      }
+    }
+    if (projectStale && isSameRequest) pendingFocus = null;
+    const delivered = projectStale ? 'stale-project'
+      : !pendingFocus ? 'consume'
+        : isSameRequest ? 'pending' : 'superseded';
+    return { ok: true, delivered };
+  });
+  ipcMain.handle('asset:consume-pending-focus', event => {
+    requireTrusted(event, 'asset');
+    const pending = pendingFocus;
+    pendingFocus = null;
+    if (focusExpired(pending)) {
+      console.warn(`[focus] expired dropped at consume: ${pending.path}`);
+      return { path: pending.path, projectId: pending.projectId, expired: true };
+    }
+    return { path: pending.path, projectId: pending.projectId };
+  });
+
+  ipcMain.handle('asset:delete-item', async (event, payload = {}) => {
+    requireTrusted(event, 'asset');
+    // 删除 = 移入系统废纸篓，可随时恢复；只允许删除当前剧本内的文件资产。
+    const { absolutePath, type } = requireCreativeAsset(payload.path);
+    if (!type || type === 'folder') throw new Error('只能删除文件资产');
+    const stat = fs.lstatSync(absolutePath);
+    if (!stat.isFile()) throw new Error('只能删除文件资产');
+    await shell.trashItem(absolutePath);
+    serverModule.broadcastCreativeAssets?.();
+    return true;
+  });
+
+  ipcMain.handle('asset:open-library', async event => {
+    requireTrusted(event, 'asset');
+    ensureCreativeAssetRoot(CREATIVE_ASSET_DIR);
+    const error = await shell.openPath(creatorPaths().activeProjectRoot);
+    if (error) throw new Error(error);
+    return true;
+  });
+
+  ipcMain.handle('asset:show-project-picker', async event => {
+    requireTrusted(event, 'asset');
+    await createMainWindow(activeMode);
+    return true;
+  });
+}
+
+async function readSmokeRenderer(webContents, expression, closedValue = 'closed') {
+  if (!webContents || webContents.isDestroyed()) return closedValue;
+  return webContents.executeJavaScript(expression).catch(error => ({ ready: 'unreadable', error: String(error.message || error) }));
+}
+
+async function creatorSmokeSnapshot() {
+  const fixtureViews = [...browserTabs.values()]
+    .map(entry => entry.view.webContents.getURL())
+    .filter(url => url.includes('/creator-fixture.html?service='));
+  const creator = await readSmokeRenderer(creatorWindow?.webContents, `({
+    ready: document.body.dataset.ready || '',
+    mode: document.body.dataset.mode || '',
+    error: document.querySelector('#browserRecoveryMessage')?.textContent?.trim().slice(0, 240) || ''
+  })`);
+  const asset = await readSmokeRenderer(assetView?.webContents, `({
+    ready: document.body.dataset.ready || '',
+    state: document.querySelector('.asset-state')?.textContent?.trim().slice(0, 240) || ''
+  })`);
+  return {
+    creatorWindow: !!creatorWindow && !creatorWindow.isDestroyed(),
+    creator,
+    activeServiceId,
+    activeView: activeView && !activeView.webContents.isDestroyed() ? activeView.webContents.getURL() : 'closed',
+    fixtureCount: fixtureViews.length,
+    fixtureViews,
+    asset,
+  };
+}
+
+async function waitForCreatorSmokeReady(timeoutMs = 18000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastSnapshot = null;
+  while (Date.now() < deadline) {
+    if (!creatorWindow || creatorWindow.isDestroyed()) throw new Error('创作浏览器窗口已关闭');
+    lastSnapshot = await creatorSmokeSnapshot();
+    if (lastSnapshot.creator.ready === 'error') {
+      throw new Error(`创作浏览器前端初始化失败：${JSON.stringify(lastSnapshot)}`);
+    }
+    if (lastSnapshot.asset.ready === 'error') {
+      throw new Error(`创作资产库初始化失败：${JSON.stringify(lastSnapshot)}`);
+    }
+    if (lastSnapshot.creator.ready === 'true' && lastSnapshot.fixtureCount > 0 && lastSnapshot.asset.ready === 'true') return;
+    await new Promise(resolve => setTimeout(resolve, 120));
+  }
+  throw new Error(`创作浏览器前端或内嵌平台页面初始化超时：${JSON.stringify(lastSnapshot || await creatorSmokeSnapshot())}`);
+}
+
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    const target = (mainWindow && !mainWindow.isDestroyed()) ? mainWindow
+      : (creatorWindow && !creatorWindow.isDestroyed()) ? creatorWindow : null;
+    if (!target) return;
+    if (target.isMinimized()) target.restore();
+    target.show();
+    target.focus();
+  });
+
+  app.whenReady().then(async () => {
+    initDiagnostics();
+    app.on('child-process-gone', (_event, details) => logDiagnostic('child-process', JSON.stringify(details)));
+    configureApplicationMenu();
+    registerIpc();
+    localServerInfo = await serverModule.startServer(START_PORT, 8, { open: false });
+    if (CANDIDATE_MODE) {
+      const { migrateCandidateLocalStorage } = require('./candidate-workspace.cjs');
+      await migrateCandidateLocalStorage({ sourceOrigin: 'http://localhost:3750', targetOrigin: localServerInfo.url, userData: app.getPath('userData') });
+    }
+    serverModule.onAssetRelocation(({ oldPath, path: newPath, oldAbsolutePath, absolutePath, isFolder }) => {
+      if (isFolder) relocateDownloadEpisodePlatform(oldPath, newPath);
+      for (const record of recentDownloads) {
+        const aliasRoot = path.join(PROJECT_ROOT, '创作资产库');
+        const saved = record.savePath && (record.savePath === aliasRoot || record.savePath.startsWith(`${aliasRoot}${path.sep}`))
+          ? CREATIVE_ASSET_DIR + record.savePath.slice(aliasRoot.length) : record.savePath;
+        // The old folder no longer exists; a realpath-based membership check cannot work here.
+        if (saved === oldAbsolutePath || (isFolder && saved && saved.startsWith(`${oldAbsolutePath}${path.sep}`))) {
+          record.savePath = path.join(absolutePath, path.relative(oldAbsolutePath, saved));
+          record.filename = path.basename(record.savePath);
+          const relative = path.relative(CREATIVE_ASSET_DIR, record.savePath).split(path.sep).join('/');
+          const owner = creativeProjectStore.get(record.productionSnapshot?.projectId);
+          if (owner) record.videoDisposition = serverModule.assetWorkflowInfo(owner, relative).videoDisposition || record.videoDisposition;
+          broadcastDownload(record);
+        }
+      }
+      if (floatVideoState && (floatVideoState.path === oldPath || (isFolder && floatVideoState.path.startsWith(`${oldPath}/`)))) closeFloatVideoWindow('asset-moved');
+    });
+    creatorAutomation = createCreatorAutomation({
+      directory: process.env.VIDEO_OS_DATA_DIR,
+      allowLocal: TEST_MODE,
+      getState: () => ({ project: creativeProjectStore.active(), ...browserState() }),
+      getProject: () => creativeProjectStore.active(),
+      getTab: tabById,
+      selectTab,
+      resolveAsset: requireCreativeAsset,
+      listAssets: search => {
+        const active = creativeProjectStore.active();
+        if (!active) throw new Error('请先选择项目');
+        const listing = buildCreativeAssetTree(CREATIVE_ASSET_DIR, { scopePath: active.folder });
+        const items = [];
+        const walk = node => { if (node.kind === 'file' && node.path.toLowerCase().includes(search.toLowerCase())) items.push(node); for (const child of node.children || []) walk(child); };
+        walk(listing.tree);
+        return { projectId: active.id, items: items.slice(0, 1000), truncated: listing.truncated || items.length > 1000 };
+      },
+    });
+    creatorAutomationServer = await serveAutomation(creatorAutomation, path.join(process.env.VIDEO_OS_DATA_DIR, 'creator-automation-connection.json'));
+    if (SMOKE_TEST) {
+      await createMainWindow();
+      await createCreatorWindow('video');
+    } else {
+      // 创作优先：直接进入创作页面，资产管理与创作共用同一窗口。
+      await createCreatorWindow({ mode: activeMode });
+    }
+    if (process.env.VIDEO_OS_TAB_MENU_TEST === '1') {
+      runTabMenuSelfTest().catch(error => {
+        console.error(`TAB_MENU_IPC_FAIL ${error.stack || error}`);
+        app.quit();
+      });
+    }
+    if (SMOKE_TEST) {
+      setTimeout(async () => {
+        try {
+          const initialAssetPanel = await creatorWindow.webContents.executeJavaScript(
+            'window.creatorAPI.setAssetPanel({ open: true, layout: "overlay", width: 360 })'
+          );
+          await waitForCreatorSmokeReady();
+          const pushPanel = await creatorWindow.webContents.executeJavaScript(
+            'window.creatorAPI.setAssetPanel({ open: true, layout: "push", width: 360 })'
+          );
+          const pushBrowserBounds = activeView.getBounds();
+          const overlayPanel = await creatorWindow.webContents.executeJavaScript(
+            'window.creatorAPI.setAssetPanel({ open: true, layout: "overlay", width: 360 })'
+          );
+          const overlayBrowserBounds = activeView.getBounds();
+          // —— 遮挡盾（结构证据）：打开清空确认框时，原生 child view 必须整体摘除。
+          //    本段读取 main 进程 contentView 真实视图树与 renderer 对话框状态，不依赖窗口焦点。 ——
+          const overlayShieldHealth = {};
+          await creatorWindow.webContents.executeJavaScript(`
+            document.getElementById('promptEditor').value = 'SHIELD-CASE';
+            document.getElementById('clearPrompt').click();
+          `);
+          for (let i = 0; i < 40 && !await creatorWindow.webContents.executeJavaScript("document.getElementById('clearPromptDialog')?.open === true"); i++) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+          for (let i = 0; i < 40 && chromeOverlaysHidden !== true; i++) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+          const childViewsDuringDialog = creatorWindow.contentView.children;
+          overlayShieldHealth.rendererDialogOpen = await creatorWindow.webContents.executeJavaScript("document.getElementById('clearPromptDialog')?.open === true");
+          overlayShieldHealth.hiddenFlagSet = chromeOverlaysHidden === true;
+          overlayShieldHealth.assetViewDetached = !childViewsDuringDialog.includes(assetView);
+          overlayShieldHealth.platformViewsDetached = [...browserTabs.values()].every(tab => !childViewsDuringDialog.includes(tab.view));
+          await creatorWindow.webContents.executeJavaScript("document.getElementById('clearPromptConfirm')?.click()");
+          for (let i = 0; i < 40 && await creatorWindow.webContents.executeJavaScript("document.getElementById('clearPromptDialog')?.open === true"); i++) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+          for (let i = 0; i < 40 && chromeOverlaysHidden !== false; i++) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+          overlayShieldHealth.rendererDialogClosed = await creatorWindow.webContents.executeJavaScript("document.getElementById('clearPromptDialog')?.open === false");
+          overlayShieldHealth.hiddenFlagCleared = chromeOverlaysHidden === false;
+          overlayShieldHealth.promptCleared = await creatorWindow.webContents.executeJavaScript("document.getElementById('promptEditor')?.value === ''");
+          overlayShieldHealth.activeViewRestored = creatorWindow.contentView.children.includes(activeView);
+          if (Object.values(overlayShieldHealth).some(value => value !== true)) {
+            throw new Error(`对话框原生遮挡盾失败：${JSON.stringify({ overlayShieldHealth, childCountDuringDialog: childViewsDuringDialog.length })}`);
+          }
+          console.log(`OVERLAY_SHIELD_PASS ${JSON.stringify(overlayShieldHealth)}`);
+          // —— 像素探针。证据层级声明：capturePage 只捕获测试窗口 HTML webContents 合成层，
+          //    不包含 WebContentsView 原生子视图，不能单独用于遮挡判定；遮挡判定以 OVERLAY_SHIELD 结构断言为准。 ——
+          const smokeVerification = { structure: 'pass', ipc: 'pass', pixels: 'not-captured', pointer: 'not-verified-this-batch' };
+          try {
+            const captured = await creatorWindow.webContents.capturePage();
+            const size = captured.getSize();
+            if (size.width > 0 && size.height > 0) {
+              const pngPath = path.join(process.env.VIDEO_OS_DATA_DIR || app.getPath('temp'), `smoke-window-${Date.now()}.png`);
+              fs.writeFileSync(pngPath, captured.toPNG());
+              smokeVerification.pixels = `pass ${size.width}x${size.height} -> ${pngPath}`;
+              console.log(`SMOKE_WINDOW_CAPTURE ${smokeVerification.pixels}`);
+            } else {
+              smokeVerification.pixels = `unavailable: empty capture ${JSON.stringify(size)}`;
+              console.log(`SMOKE_WINDOW_CAPTURE_UNAVAILABLE ${smokeVerification.pixels}`);
+            }
+          } catch (captureError) {
+            smokeVerification.pixels = `unavailable: ${captureError.message}`;
+            console.log(`SMOKE_WINDOW_CAPTURE_UNAVAILABLE ${smokeVerification.pixels}`);
+          }
+          // —— IPC 项目切换：HTTP activate → fixture server 广播（creative-projects SSE）→ creator.js 既有串行链 → renderer 应用。
+          //     同时核对四项：store id、renderer 标题、renderer 草稿、store 归属；重复同项目不得重置草稿；快速 A/B 收敛后必须一致。 ——
+          const projectSwitchIpc = {};
+          const projectApiBase = `http://127.0.0.1:${localServerInfo.port}/api/creative-projects`;
+          const postProjectAction = async body => (await fetch(projectApiBase, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
+          const readRenderer = async () => creatorWindow.webContents.executeJavaScript(`({
+            title: document.getElementById('currentProject')?.textContent || '',
+            draft: document.getElementById('promptEditor')?.value ?? null,
+          })`);
+          const waitForRendererProject = async (namePart, timeoutRounds = 60) => {
+            for (let i = 0; i < timeoutRounds; i++) {
+              await new Promise(resolve => setTimeout(resolve, 50));
+              const view = await readRenderer();
+              if (view.title.includes(namePart)) return view;
+            }
+            return readRenderer();
+          };
+          const originalProjectId = creativeProjectStore.active()?.id;
+          const originalProjectName = creativeProjectStore.active()?.name || '';
+          // 预置原剧本草稿并等待防抖落盘，供切回后核对 renderer 恢复
+          await creatorWindow.webContents.executeJavaScript(`
+            (() => {
+              const editor = document.getElementById('promptEditor');
+              editor.value = 'A-KEEP';
+              editor.dispatchEvent(new Event('input', { bubbles: true }));
+            })();
+          `);
+          await new Promise(resolve => setTimeout(resolve, 450));
+          const createdProject = await postProjectAction({ action: 'create', name: '烟测剧本B' });
+          projectSwitchIpc.createAccepted = createdProject?.project?.id != null;
+          const targetProjectId = createdProject?.project?.id || '';
+          if (targetProjectId) await postProjectAction({ action: 'activate', id: targetProjectId });
+          const viewB = await waitForRendererProject('烟测剧本B');
+          projectSwitchIpc.storeActivated = creativeProjectStore.active()?.id === targetProjectId;
+          projectSwitchIpc.rendererApplied = viewB.title.includes('烟测剧本B');
+          projectSwitchIpc.rendererDraftIsolated = viewB.draft === '';
+          // 给 B 写入自己的草稿并落盘，供“切回也验证 renderer”使用
+          await creatorWindow.webContents.executeJavaScript(`
+            (() => {
+              const editor = document.getElementById('promptEditor');
+              editor.value = 'B-DRAFT';
+              editor.dispatchEvent(new Event('input', { bubbles: true }));
+            })();
+          `);
+          await new Promise(resolve => setTimeout(resolve, 450));
+          if (originalProjectId) await postProjectAction({ action: 'activate', id: originalProjectId });
+          const viewBackA = await waitForRendererProject(originalProjectName);
+          projectSwitchIpc.switchedBack = creativeProjectStore.active()?.id === originalProjectId
+            && viewBackA.title.includes(originalProjectName);
+          projectSwitchIpc.rendererDraftRestored = viewBackA.draft === 'A-KEEP';
+          // 重复同项目 activate：同 id 守卫不得重置草稿
+          await postProjectAction({ action: 'activate', id: originalProjectId });
+          await new Promise(resolve => setTimeout(resolve, 600));
+          projectSwitchIpc.duplicateKeepsDraft = (await readRenderer()).draft === 'A-KEEP';
+          // 快速 A/B 连发（不等待上一轮完成）：收敛后四项必须一致
+          await postProjectAction({ action: 'activate', id: targetProjectId });
+          await postProjectAction({ action: 'activate', id: originalProjectId });
+          const viewRace = await waitForRendererProject(originalProjectName);
+          projectSwitchIpc.raceStoreId = creativeProjectStore.active()?.id === originalProjectId;
+          projectSwitchIpc.raceTitleConsistent = viewRace.title.includes(originalProjectName);
+          projectSwitchIpc.raceDraftConsistent = viewRace.draft === 'A-KEEP';
+          if (!projectSwitchIpc.createAccepted || !projectSwitchIpc.storeActivated || !projectSwitchIpc.rendererApplied
+            || !projectSwitchIpc.rendererDraftIsolated || !projectSwitchIpc.switchedBack
+            || !projectSwitchIpc.rendererDraftRestored || !projectSwitchIpc.duplicateKeepsDraft
+            || !projectSwitchIpc.raceStoreId || !projectSwitchIpc.raceTitleConsistent || !projectSwitchIpc.raceDraftConsistent) {
+            throw new Error(`IPC 项目切换验证失败：${JSON.stringify({ projectSwitchIpc })}`);
+          }
+          await creatorWindow.webContents.executeJavaScript("document.getElementById('promptEditor').value = ''");
+          console.log(`PROJECT_SWITCH_IPC_PASS ${JSON.stringify(projectSwitchIpc)}`);
+          // —— 跳转定位三路径：真实 handler → 面板（未就绪 boot consume / 就绪推送 / 关闭重开推送）。 ——
+          const focusLinkHealth = {};
+          const focusReadPanel = () => assetView.webContents.executeJavaScript(`({
+            ready: document.body?.dataset?.ready === 'true',
+            previewOpen: document.getElementById('previewDialog')?.open === true,
+            previewName: document.getElementById('previewName')?.textContent || '',
+          })`);
+          const panelPreviewOpen = async () => {
+            for (let i = 0; i < 80; i++) {
+              try { if ((await focusReadPanel()).previewOpen) return true; } catch {}
+              await new Promise(resolve => setTimeout(resolve, 50));
+            }
+            return false;
+          };
+          // 路径 2：面板重载未就绪时跳转 → 登记 pending → boot consume 后定位
+          await assetView.webContents.reloadIgnoringCache();
+          const consumeResult = await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.focusAssetInLibrary(${JSON.stringify('测试剧本/测试角色.png')})`
+          );
+          focusLinkHealth.unreadyHandled = ['pending', 'push', 'consume'].includes(consumeResult.delivered);
+          // 注：烟测重载窗口较短，面板常在就绪检测前完成加载而走 push；未就绪→pending 分支由
+          // test_creator_assets 的 boot-consume 用例覆盖（localStorage 登记 → 重载 → 定位断言）。
+          focusLinkHealth.consumeLocated = await panelPreviewOpen()
+            && (await focusReadPanel().catch(() => ({ previewName: '' }))).previewName.includes('测试角色.png');
+          // 路径 1：面板已就绪 → push 推送（第二次跳转不丢失）
+          const pushResult = await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.focusAssetInLibrary(${JSON.stringify('测试剧本/测试角色.png')})`
+          );
+          focusLinkHealth.readyPush = pushResult.delivered === 'push';
+          await new Promise(resolve => setTimeout(resolve, 250));
+          focusLinkHealth.pushLocated = await panelPreviewOpen();
+          // 路径 3：关闭面板后重开 → 页面未销毁，仍走推送并可定位
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.setAssetPanel({ open: false })');
+          await new Promise(resolve => setTimeout(resolve, 120));
+          const reopenResult = await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.focusAssetInLibrary(${JSON.stringify('测试剧本/测试角色.png')})`
+          );
+          focusLinkHealth.reopenPush = reopenResult.delivered === 'push';
+          await new Promise(resolve => setTimeout(resolve, 250));
+          focusLinkHealth.reopenLocated = await panelPreviewOpen();
+          if (Object.values(focusLinkHealth).some(value => value !== true)) {
+            throw new Error(`跳转定位三路径失败：${JSON.stringify(focusLinkHealth)}`);
+          }
+          console.log(`FOCUS_LINK_PASS ${JSON.stringify(focusLinkHealth)}`);
+          const ui = await creatorWindow.webContents.executeJavaScript(`({
+            mode: document.body.dataset.mode,
+            tabs: Array.from(document.querySelectorAll('.platform-tab')).map(node => node.textContent),
+            promptLength: document.querySelector('#promptEditor')?.value.length || 0,
+            promptAccordionOpen: document.querySelector('#promptAccordion')?.open,
+            assetAccordionOpen: document.querySelector('#assetAccordion')?.open,
+            quickAssetCount: document.querySelectorAll('.asset-image-card').length,
+            assetTogglePressed: document.querySelector('#toggleAssets')?.getAttribute('aria-pressed'),
+            addressEnabled: !document.querySelector('#addressInput')?.disabled
+          })`);
+          const assetUi = await assetView.webContents.executeJavaScript(`({
+            ready: document.body.dataset.ready,
+            layout: document.body.dataset.layout,
+            imageCount: document.querySelectorAll('.image-card').length,
+            folderCount: document.querySelectorAll('.folder-button').length
+          })`);
+          const fixtureViews = [...browserTabs.values()]
+            .map(entry => entry.view.webContents.getURL())
+            .filter(url => url.includes('/creator-fixture.html?service='));
+          // 发出真实鼠标事件：收起浮层的同一次点击仍须到达网页。
+          const preservedAssetView = assetView;
+          await assetView.webContents.executeJavaScript(`
+            document.getElementById('assetSearch').value = '测试角色';
+          `);
+          await activeView.webContents.executeJavaScript(`
+            window.__assetOverlayClicks = 0;
+            window.__assetOverlayEvents = [];
+            for (const type of ['mousedown', 'mouseup', 'click']) document.addEventListener(type, event => {
+              window.__assetOverlayEvents.push([type, event.clientX, event.clientY, event.target.tagName]);
+            }, true);
+            const target = document.createElement('button');
+            target.textContent = '点击继续网页';
+            target.style.cssText = 'position:fixed;left:10px;top:10px;width:160px;height:50px;z-index:9999';
+            target.onclick = () => window.__assetOverlayClicks++;
+            document.body.appendChild(target);
+          `);
+          creatorWindow.show();
+          creatorWindow.focus();
+          activeView.webContents.focus();
+          await new Promise(resolve => setTimeout(resolve, 150));
+          const clickFixture = async () => {
+            activeView.webContents.sendInputEvent({ type: 'mouseMove', x: 30, y: 30 });
+            activeView.webContents.sendInputEvent({ type: 'mouseDown', x: 30, y: 30, button: 'left', clickCount: 1 });
+            await new Promise(resolve => setTimeout(resolve, 40));
+            activeView.webContents.sendInputEvent({ type: 'mouseUp', x: 30, y: 30, button: 'left', clickCount: 1 });
+          };
+          // —— POINTER_DIAG（D1/D2，只读采集，不改任何成功门槛）：
+          //    记录输入事件前后的焦点、几何、缩放与点击计数，并用 HTML 层探针与 WebContentsView 通道对照。 ——
+          const collectPointerDiag = async tag => ({
+            tag,
+            windowFocused: creatorWindow.isFocused(),
+            activeViewWebFocused: activeView.webContents.isFocused(),
+            creatorWebFocused: creatorWindow.webContents.isFocused(),
+            renderer: await activeView.webContents.executeJavaScript('({ hasFocus: document.hasFocus(), visibility: document.visibilityState })'),
+            zoom: activeView.webContents.getZoomFactor(),
+            activeViewBounds: activeView.getBounds(),
+            buttonRect: await activeView.webContents.executeJavaScript('(() => { const r = document.querySelector("button")?.getBoundingClientRect(); return r ? { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) } : null; })()'),
+            clicks: await activeView.webContents.executeJavaScript('window.__assetOverlayClicks || 0'),
+          });
+          const dualChannelProbe = {};
+          try {
+            await creatorWindow.webContents.executeJavaScript(`
+              (() => {
+                const probe = document.createElement('button');
+                probe.id = 'smokeInputProbe';
+                probe.textContent = 'probe';
+                probe.style.cssText = 'position:fixed;left:8px;top:8px;width:60px;height:30px;z-index:99999';
+                probe.addEventListener('click', () => { window.__smokeProbeHits = (window.__smokeProbeHits || 0) + 1; });
+                document.body.appendChild(probe);
+              })()
+            `);
+            creatorWindow.webContents.sendInputEvent({ type: 'mouseMove', x: 30, y: 20 });
+            creatorWindow.webContents.sendInputEvent({ type: 'mouseDown', x: 30, y: 20, button: 'left', clickCount: 1 });
+            creatorWindow.webContents.sendInputEvent({ type: 'mouseUp', x: 30, y: 20, button: 'left', clickCount: 1 });
+            await new Promise(resolve => setTimeout(resolve, 150));
+            dualChannelProbe.htmlLayerHit = await creatorWindow.webContents.executeJavaScript('window.__smokeProbeHits === 1');
+          } catch (probeError) {
+            dualChannelProbe.htmlLayerHit = `probe-error: ${probeError.message}`;
+          }
+          const pointerDiagPre = await collectPointerDiag('pre-click1');
+          await clickFixture();
+          for (let i = 0; i < 60 && await activeView.webContents.executeJavaScript('window.__assetOverlayClicks') < 1; i++) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+          }
+          const pointerDiagPost1 = await collectPointerDiag('post-click1');
+          const overlayFocusHealth = {
+            clickDismissed: !assetPanelState.open && !assetViewAttached,
+            clickReachedPage: await activeView.webContents.executeJavaScript('window.__assetOverlayClicks') === 1,
+          };
+          applyCreatorLayout({ reorder: true });
+          overlayFocusHealth.staysBehind = !creatorWindow.contentView.children.includes(assetView);
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.setAssetPanel({ open: true })');
+          overlayFocusHealth.reopenedWithState = assetView === preservedAssetView && assetViewAttached
+            && await assetView.webContents.executeJavaScript('document.getElementById("assetSearch").value') === '测试角色';
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.focusBrowser()');
+          overlayFocusHealth.focusDismissed = !assetPanelState.open;
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.setAssetPanel({ open: true, layout: "push" })');
+          await clickFixture();
+          for (let i = 0; i < 60 && await activeView.webContents.executeJavaScript('window.__assetOverlayClicks') < 2; i++) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+          }
+          const pointerDiagPost2 = await collectPointerDiag('post-click2');
+          const pointerDiag = { dualChannelProbe, pre: pointerDiagPre, post1: pointerDiagPost1, post2: pointerDiagPost2 };
+          console.log(`POINTER_DIAG ${JSON.stringify(pointerDiag)}`);
+          const occludedHidden = pointerDiag.pre.renderer.visibility === 'hidden' || pointerDiag.post2.renderer.visibility === 'hidden';
+          const pointerVerdict = occludedHidden && dualChannelProbe.htmlLayerHit === true && pointerDiagPre.zoom === 1
+            ? 'environment-input-gated: occluded WebContentsView renderer visibility=hidden so Chromium drops mouse input before product code; HTML layer probe reachable; coordinates/zoom normal'
+            : 'inconclusive: see POINTER_DIAG for focus/geometry evidence';
+          console.log(`POINTER_VERDICT ${pointerVerdict}`);
+          overlayFocusHealth.splitViewKept = assetPanelState.open && assetViewAttached
+            && await activeView.webContents.executeJavaScript('window.__assetOverlayClicks') === 2;
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.setAssetPanel({ open: true, layout: "overlay" })');
+          if (Object.values(overlayFocusHealth).some(value => value !== true)) {
+            const inputDetails = await activeView.webContents.executeJavaScript('({events: window.__assetOverlayEvents, target: document.elementFromPoint(30, 30)?.outerHTML, width: innerWidth, height: innerHeight})');
+            throw new Error(`资产浮层切换失败：${JSON.stringify({ overlayFocusHealth, inputDetails, pointerDiag })}`);
+          }
+          console.log(`ASSET_OVERLAY_FOCUS_PASS ${JSON.stringify(overlayFocusHealth)}`);
+          smokeVerification.pointer = 'pass';
+          // 多开检查：同一平台连开两个网页，再关闭当前标签应回退到相邻标签。
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.selectService("gpt", "video")');
+          const firstTabId = [...browserTabs.keys()][0];
+          await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.openTab("gpt", "video", ${JSON.stringify(firstTabId)})`
+          );
+          const multiTabHealth = { afterOpen: browserTabs.size, activeBeforeClose: activeTabId };
+          // 复制标签：新标签应紧邻源标签插入
+          multiTabHealth.adjacent = [...browserTabs.keys()][1] === activeTabId;
+          multiTabHealth.patchApplied = await activeView.webContents
+            .executeJavaScript('!!window.__vosChromePatched && navigator.plugins.length > 0 && navigator.webdriver === false')
+            .catch(() => false);
+          // 加载超时：挂起端点应在阈值后标记 loadTimedOut；正常导航后清除
+          await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.navigateUrl(${JSON.stringify(localServerInfo.url + '/__test__/hang')})`
+          );
+          for (let i = 0; i < 60 && !(tabById(activeTabId) && tabById(activeTabId).loadTimedOut); i++) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+          multiTabHealth.loadTimeoutMarked = !!(tabById(activeTabId) && tabById(activeTabId).loadTimedOut);
+          await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.navigateUrl(${JSON.stringify(localServerInfo.url + '/creator-fixture.html?service=updream')})`
+          );
+          for (let i = 0; i < 60 && (tabById(activeTabId) && tabById(activeTabId).loadTimedOut); i++) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+          multiTabHealth.loadTimeoutCleared = !(tabById(activeTabId) && tabById(activeTabId).loadTimedOut);
+          // 停止已超时的加载：did-stop-loading 应给出中性后续说明
+          await creatorWindow.webContents.executeJavaScript(`window.creatorAPI.navigateUrl(${JSON.stringify(localServerInfo.url + '/__test__/hang')})`);
+          for (let i = 0; i < 60 && !(tabById(activeTabId) && tabById(activeTabId).loadTimedOut); i++) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+          await creatorWindow.webContents.executeJavaScript(`window.creatorAPI.navigate('stop')`);
+          for (let i = 0; i < 60 && !((tabById(activeTabId) && tabById(activeTabId).error || '').includes('已停止加载')); i++) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+          multiTabHealth.stopAfterTimeoutGuided = (tabById(activeTabId) && tabById(activeTabId).error || '').includes('已停止加载');
+          await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.navigateUrl(${JSON.stringify(localServerInfo.url + '/creator-fixture.html?service=updream')})`
+          );
+          for (let i = 0; i < 60 && ((tabById(activeTabId) && tabById(activeTabId).error || '') !== ''); i++) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+          multiTabHealth.stoppedNoteCleared = (tabById(activeTabId) && tabById(activeTabId).error || '') === '';
+          // 同页导航状态：主框架 URL 重算拒绝状态；仅 hash 变化保持；子框架不覆盖顶层
+          const rejTab = tabById(activeTabId);
+          if (rejTab) {
+            rejTab.view.webContents.emit('did-navigate-in-page', { preventDefault() {} }, 'https://accounts.google.com/v3/signin/rejected?x=1', true);
+            multiTabHealth.loginRejectedWired = rejTab.loginRejected === true;
+            rejTab.view.webContents.emit('did-navigate-in-page', { preventDefault() {} }, 'https://accounts.google.com/v3/signin/rejected#anchor', true);
+            multiTabHealth.loginRejectedHashKept = rejTab.loginRejected === true;
+            rejTab.view.webContents.emit('did-navigate-in-page', { preventDefault() {} }, 'https://chatgpt.com/', false);
+            multiTabHealth.loginRejectedMainFrameOnly = rejTab.loginRejected === true;
+            rejTab.view.webContents.emit('did-navigate', { preventDefault() {} }, 'https://chatgpt.com/');
+            multiTabHealth.loginRejectedClearedOnNavigate = rejTab.loginRejected === false;
+          }
+          await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.closeTab(${JSON.stringify(activeTabId)})`
+          );
+          multiTabHealth.afterClose = browserTabs.size;
+          multiTabHealth.activeAfterClose = activeServiceId;
+          // 拖拽换位：swap 互换与 move 移到末尾都要改写 browserTabs 顺序、反映到返回值，并广播到界面标签栏 DOM。
+          const orderBeforeReorder = [...browserTabs.keys()];
+          if (orderBeforeReorder.length >= 2) {
+            const domTabIds = () => creatorWindow.webContents.executeJavaScript(
+              "[...document.querySelectorAll('#platformTabs .platform-tab')].map(button => button.dataset.tabId)"
+            );
+            // 界面只显示当前模式的标签：DOM 顺序应与全局顺序按当前模式过滤后的结果一致
+            const visibleIds = order => order.filter(id => {
+              const tab = browserTabs.get(id);
+              return tab && tab.mode === activeMode && validServiceForMode(activeMode, tab.serviceId);
+            });
+            const waitDomOrder = async expected => {
+              const expectedDom = visibleIds(expected).join('\n');
+              let domIds = [];
+              for (let i = 0; i < 40; i++) {
+                domIds = await domTabIds();
+                if (domIds.join('\n') === expectedDom) break;
+                await new Promise(resolve => setTimeout(resolve, 50));
+              }
+              return domIds.join('\n') === expectedDom;
+            };
+            const expectedSwapped = [orderBeforeReorder[1], orderBeforeReorder[0], ...orderBeforeReorder.slice(2)];
+            const swapped = await creatorWindow.webContents.executeJavaScript(
+              `window.creatorAPI.reorderTabs({ swapTabId: ${JSON.stringify(orderBeforeReorder[0])}, withTabId: ${JSON.stringify(orderBeforeReorder[1])} })`
+            );
+            multiTabHealth.reorderSwapped = [...browserTabs.keys()].join('\n') === expectedSwapped.join('\n')
+              && (swapped?.tabs || []).map(tab => tab.id).join('\n') === expectedSwapped.join('\n')
+              && await waitDomOrder(expectedSwapped);
+            const expectedMoved = expectedSwapped.filter(id => id !== orderBeforeReorder[1]).concat(orderBeforeReorder[1]);
+            const movedBack = await creatorWindow.webContents.executeJavaScript(
+              `window.creatorAPI.reorderTabs({ moveTabId: ${JSON.stringify(orderBeforeReorder[1])}, beforeTabId: '' })`
+            );
+            multiTabHealth.reorderMovedToEnd = [...browserTabs.keys()].join('\n') === expectedMoved.join('\n')
+              && (movedBack?.tabs || []).map(tab => tab.id).join('\n') === expectedMoved.join('\n')
+              && await waitDomOrder(expectedMoved);
+          } else {
+            multiTabHealth.reorderSwapped = false;
+            multiTabHealth.reorderMovedToEnd = false;
+          }
+          // 浏览器级标签能力：固定置顶、一键静音、撤销关闭
+          const pinTargetId = [...browserTabs.keys()][0];
+          await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.pinTab(${JSON.stringify(pinTargetId)}, true)`
+          );
+          multiTabHealth.pinnedFront = [...browserTabs.keys()][0] === pinTargetId
+            && browserTabs.get(pinTargetId).pinned === true;
+          multiTabHealth.muteToggled = await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.setTabMuted(${JSON.stringify(pinTargetId)}, true).then(state => !!state.tabs.find(tab => tab.id === ${JSON.stringify(pinTargetId)}).muted)`
+          );
+          const closeForUndoId = [...browserTabs.keys()].find(id => id !== pinTargetId);
+          const sizeBeforeUndo = browserTabs.size;
+          await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.closeTab(${JSON.stringify(closeForUndoId)})`
+          );
+          const restoredState = await creatorWindow.webContents.executeJavaScript(
+            'window.creatorAPI.restoreClosedTab()'
+          );
+          multiTabHealth.restoreClosed = browserTabs.size === sizeBeforeUndo && !!restoredState?.tabId;
+          await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.pinTab(${JSON.stringify(pinTargetId)}, false)`
+          );
+          await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.setTabMuted(${JSON.stringify(pinTargetId)}, false)`
+          );
+          // 使用真实网页实例验证双模式隔离，不能只检查标签文字。
+          const videoTab = tabById(activeTabId);
+          for (let i = 0; i < 80 && videoTab.view.webContents.isLoading(); i++) await new Promise(resolve => setTimeout(resolve, 25));
+          await videoTab.view.webContents.executeJavaScript(`
+            history.replaceState(null, '', '#video-draft');
+            const draft = document.createElement('textarea'); draft.id = 'modeDraft'; draft.value = '视频对白草稿';
+            document.body.appendChild(draft);
+          `);
+          const videoUrl = videoTab.view.webContents.getURL();
+          await creatorWindow.webContents.executeJavaScript(`window.creatorAPI.renameTab(${JSON.stringify(videoTab.id)}, '视频脚本')`);
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.setMode("image", "gpt")');
+          const imageTab = tabById(activeTabId);
+          const modeIsolationHealth = {
+            separatePages: imageTab.id !== videoTab.id && imageTab.view !== videoTab.view,
+            sharedLogin: imageTab.session === videoTab.session,
+            fixedOwnership: imageTab.mode === 'image' && videoTab.mode === 'video',
+          };
+          const downloadsBefore = recentDownloads.length;
+          await videoTab.view.webContents.executeJavaScript('document.getElementById("testVideoDownload").click()', true);
+          for (let i = 0; i < 80 && (recentDownloads.length === downloadsBefore || recentDownloads[0].state === 'progressing'); i++) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+          }
+          modeIsolationHealth.backgroundDownload = recentDownloads.length > downloadsBefore
+            && recentDownloads[0].mode === 'video' && recentDownloads[0].state === 'completed';
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.openTab("gpt", "image")');
+          const secondImageId = activeTabId;
+          await creatorWindow.webContents.executeJavaScript(`window.creatorAPI.renameTab(${JSON.stringify(secondImageId)}, '人物图')`);
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.setMode("video", "gpt")');
+          modeIsolationHealth.videoRestored = activeTabId === videoTab.id && videoTab.customName === '视频脚本'
+            && videoTab.view.webContents.getURL() === videoUrl
+            && await videoTab.view.webContents.executeJavaScript('document.getElementById("modeDraft").value') === '视频对白草稿';
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.setMode("image", "gpt")');
+          modeIsolationHealth.lastMultiTabRestored = activeTabId === secondImageId && tabById(activeTabId).customName === '人物图';
+          await creatorWindow.webContents.executeJavaScript(`window.creatorAPI.closeTab(${JSON.stringify(secondImageId)})`);
+          modeIsolationHealth.closeStaysInMode = activeMode === 'image' && activeTabId === imageTab.id;
+          await creatorWindow.webContents.executeJavaScript(`window.creatorAPI.closeTab(${JSON.stringify(imageTab.id)})`);
+          modeIsolationHealth.lastCloseStaysInMode = activeMode === 'image' && activeTabId === null && browserTabs.has(videoTab.id);
+          for (const tab of [...browserTabs.values()].filter(tab => tab.mode === 'image')) destroyTab(tab);
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.setMode("video", "gpt")');
+          if (Object.values(modeIsolationHealth).some(value => value !== true)) {
+            throw new Error(`图片／视频网页隔离失败：${JSON.stringify(modeIsolationHealth)}`);
+          }
+          console.log(`MODE_ISOLATION_PASS ${JSON.stringify(modeIsolationHealth)}`);
+          const customPlatform = await creatorWindow.webContents.executeJavaScript(
+            'window.creatorAPI.addCustomService({ name: "烟测创作站", url: "https://example.test/studio" })'
+          );
+          const customConfig = await creatorWindow.webContents.executeJavaScript('window.creatorAPI.getConfig()');
+          await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.selectService(${JSON.stringify(customPlatform.id)}, "video")`
+          );
+          for (let attempt = 0; attempt < 60 && !(activeView?.webContents.getURL() || '').includes('creator-fixture.html'); attempt++) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+          }
+          const customFixtureUrl = activeView?.webContents.getURL() || '';
+          await creatorWindow.webContents.executeJavaScript(
+            `window.creatorAPI.removeCustomService(${JSON.stringify(customPlatform.id)})`
+          );
+          const configAfterCustomRemove = await creatorWindow.webContents.executeJavaScript('window.creatorAPI.getConfig()');
+          const customPlatformHealth = {
+            addedToImage: customConfig.modeServices.image.includes(customPlatform.id),
+            addedToVideo: customConfig.modeServices.video.includes(customPlatform.id),
+            fixtureUrl: customFixtureUrl,
+            removed: !configAfterCustomRemove.services.some(service => service.id === customPlatform.id),
+            fallbackService: activeServiceId,
+          };
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.removeService("grok")');
+          const configAfterBuiltinHide = await creatorWindow.webContents.executeJavaScript('window.creatorAPI.getConfig()');
+          await creatorWindow.webContents.executeJavaScript('window.creatorAPI.restoreBuiltinService("grok")');
+          const configAfterBuiltinRestore = await creatorWindow.webContents.executeJavaScript('window.creatorAPI.getConfig()');
+          const builtinPlatformHealth = {
+            hidden: configAfterBuiltinHide.hiddenBuiltinIds.includes('grok')
+              && !configAfterBuiltinHide.modeServices.image.includes('grok')
+              && !configAfterBuiltinHide.modeServices.video.includes('grok'),
+            restored: !configAfterBuiltinRestore.hiddenBuiltinIds.includes('grok')
+              && configAfterBuiltinRestore.modeServices.image.includes('grok')
+              && configAfterBuiltinRestore.modeServices.video.includes('grok'),
+          };
+          // 同窗往返：触发真实按钮，平台 renderer 与未提交内容必须保留。
+          const workspaceId = creatorWindow.id;
+          const tabSnapshot = () => [...browserTabs.values()].map(tab => ({
+            id: tab.id, contentsId: tab.view.webContents.id, url: tab.view.webContents.getURL(),
+          }));
+          const beforeNavigation = tabSnapshot();
+          const previousActiveId = activeTabId;
+          await activeView.webContents.executeJavaScript("window.__navigationDraft = 'UNSENT-KEEP'");
+          await creatorWindow.webContents.executeJavaScript("document.getElementById('showMainWindow').click(); true");
+          for (let i = 0; i < 100; i++) {
+            const ready = await readSmokeRenderer(mainWindow?.webContents, "location.pathname === '/' && typeof WM !== 'undefined' && !!WM.activeId");
+            if (ready === true) break;
+            await new Promise(resolve => setTimeout(resolve, 60));
+          }
+          const mainPage = await mainWindow.webContents.executeJavaScript(`({
+            route: location.pathname,
+            retiredNav: document.querySelectorAll('[data-app="scripts"], [data-app="projects"]').length,
+            ready: typeof WM !== 'undefined' && !!WM.activeId,
+          })`);
+          const detached = [...browserTabs.values()].every(tab => !mainWindow.contentView.children.includes(tab.view))
+            && (!assetView || !mainWindow.contentView.children.includes(assetView));
+          await mainWindow.webContents.executeJavaScript("WM.open('assets'); true");
+          await mainWindow.webContents.executeJavaScript("document.querySelector('.library-advanced-toggle').click()");
+          const filters = await mainWindow.webContents.executeJavaScript(`({
+            expanded: document.querySelector('.library-advanced-toggle').getAttribute('aria-expanded'),
+            toolbarHeight: document.querySelector('.assets-toolbar').getBoundingClientRect().height,
+            controlsVisible: !document.querySelector('.library-advanced-controls').hidden,
+          })`);
+          await mainWindow.webContents.executeJavaScript("window.desktopOS.openCreatorBrowser({mode:'video'}); true");
+          await waitForCreatorSmokeReady();
+          const sameWindowHealth = {
+            oneWindow: BrowserWindow.getAllWindows().length === 1 && creatorWindow.id === workspaceId && creatorWindow === mainWindow,
+            mainPage, detached, filters,
+            tabsPreserved: JSON.stringify(beforeNavigation) === JSON.stringify(tabSnapshot()) && previousActiveId === activeTabId,
+            draftPreserved: await activeView.webContents.executeJavaScript("window.__navigationDraft === 'UNSENT-KEEP'"),
+          };
+          if (!sameWindowHealth.oneWindow || !mainPage.ready || mainPage.retiredNav || !detached
+            || !sameWindowHealth.tabsPreserved || !sameWindowHealth.draftPreserved
+            || filters.expanded !== 'true' || !filters.controlsVisible || filters.toolbarHeight > 100) {
+            throw new Error('同窗切换失败：' + JSON.stringify(sameWindowHealth));
+          }
+          console.log('SAME_WINDOW_NAVIGATION_PASS ' + JSON.stringify(sameWindowHealth));
+          const productionHealth = productionStore && productionStore.health();
+          const smokeShot = productionStore && productionStore.createShot({
+            shotNo: `SMOKE-${Date.now()}`,
+            title: '桌面发行版制作台账验证',
+            status: 'planned',
+          });
+          const priorSmokeContext = productionStore && productionStore.getContext();
+          const smokeContext = smokeShot && productionStore.setContext({
+            activeShotId: smokeShot.id,
+            mode: 'video',
+            serviceId: 'updream',
+            expectedRevision: priorSmokeContext && priorSmokeContext.revision,
+          });
+          if (ui.mode !== 'video' || ui.tabs.length !== 1 || ui.tabs[0] !== 'Updream'
+            || !ui.addressEnabled || ui.promptLength !== 0
+            || ui.promptAccordionOpen !== false || ui.assetAccordionOpen !== true || ui.quickAssetCount !== 1
+            || ui.assetTogglePressed !== 'true' || assetUi.ready !== 'true' || assetUi.imageCount !== 1
+            || !assetUi.folderCount || pushPanel.layout !== 'push' || overlayPanel.layout !== 'overlay'
+            || pushBrowserBounds.width >= overlayBrowserBounds.width || !fixtureViews.length
+            || multiTabHealth.afterOpen !== 3 || multiTabHealth.afterClose !== 2 || multiTabHealth.activeAfterClose !== 'gpt'
+            || !multiTabHealth.reorderSwapped || !multiTabHealth.reorderMovedToEnd
+            || !multiTabHealth.pinnedFront || !multiTabHealth.muteToggled || !multiTabHealth.restoreClosed
+            || !multiTabHealth.adjacent || !multiTabHealth.patchApplied
+            || !multiTabHealth.loadTimeoutMarked || !multiTabHealth.loadTimeoutCleared
+            || !multiTabHealth.stopAfterTimeoutGuided || !multiTabHealth.stoppedNoteCleared
+            || !multiTabHealth.loginRejectedWired || !multiTabHealth.loginRejectedHashKept
+            || !multiTabHealth.loginRejectedMainFrameOnly || !multiTabHealth.loginRejectedClearedOnNavigate
+            || configAfterCustomRemove.modeServices.video.length !== 7
+            || !customPlatformHealth.addedToImage || !customPlatformHealth.addedToVideo
+            || !customPlatformHealth.fixtureUrl.includes(`service=${encodeURIComponent(customPlatform.id)}`)
+            || !customPlatformHealth.removed || customPlatformHealth.fallbackService !== 'updream'
+            || !builtinPlatformHealth.hidden || !builtinPlatformHealth.restored
+            || !initialAssetPanel.open || !productionHealth?.ok || !smokeContext || smokeContext.active_shot_id !== smokeShot.id) {
+            throw new Error(`桌面烟雾检查不完整：${JSON.stringify({ ui, assetUi, initialAssetPanel, pushPanel, overlayPanel, pushBrowserBounds, overlayBrowserBounds, fixtureViews, multiTabHealth, customPlatformHealth, builtinPlatformHealth, productionHealth, smokeContext })}`);
+          }
+          console.log(`ELECTRON_SMOKE_PASS ${JSON.stringify({ packaged: app.isPackaged, mainUrl: mainWindow?.webContents.getURL(), creatorUrl: creatorWindow?.webContents.getURL(), ui, assetUi, assetPanel: publicAssetPanelState(), pushBrowserBounds, overlayBrowserBounds, fixtureViews, multiTabHealth, customPlatformHealth, builtinPlatformHealth, production: { health: productionHealth.ok, activeShot: smokeContext.shot_no }, smokeVerification })}`);
+          app.exit(0);
+        } catch (error) {
+          console.error(`ELECTRON_SMOKE_FAIL ${error.stack || error}`);
+          app.exit(1);
+        }
+      }, 150);
+    }
+  }).catch(error => {
+    logDiagnostic('startup', error);
+    app.exit(1);
+  });
+}
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('activate', () => {
+  if (process.platform !== 'darwin' || !localServerInfo) return;
+  if (creatorWindow && !creatorWindow.isDestroyed()) {
+    creatorWindow.show();
+    creatorWindow.focus();
+    return;
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createCreatorWindow({ mode: activeMode }).catch(error => logDiagnostic('activate', error));
+    return;
+  }
+  mainWindow.show();
+});
+
+app.on('before-quit', () => {
+  appQuitting = true;
+  downloadReviewUI?.stop();
+  persistBrowserSession();
+  creatorAutomationServer?.close();
+  if (serverModule.server.listening) serverModule.server.close();
+  try { if (productionStore) productionStore.close(); } catch {}
+});

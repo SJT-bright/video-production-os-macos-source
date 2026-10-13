@@ -1,0 +1,103 @@
+'use strict';
+
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
+
+// 两个工作页面共用宿主窗口，IPC 在主进程按当前页面校验。
+contextBridge.exposeInMainWorld('desktopOS', Object.freeze({
+  isElectron: true,
+  openCreatorBrowser: request => ipcRenderer.invoke('os:open-creator', request),
+  addMediaSource: kind => ipcRenderer.invoke('os:add-media-source', kind),
+  removeMediaSource: sourceId => ipcRenderer.invoke('os:remove-media-source', sourceId),
+  onOpenProjectPicker: callback => subscribe('os:open-project-picker', callback),
+  onDownloadComplete: callback => subscribe('os:download-complete', callback),
+}));
+
+function subscribe(channel, callback) {
+  if (typeof callback !== 'function') return () => {};
+  const listener = (_event, payload) => callback(payload);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
+contextBridge.exposeInMainWorld('creatorAPI', Object.freeze({
+  automation: (name, args = {}) => ipcRenderer.invoke('creator:automation', { name, arguments: args }),
+  getConfig: () => ipcRenderer.invoke('creator:get-config'),
+  getDownloadEpisodes: () => ipcRenderer.invoke('creator:get-download-episodes'),
+  advanceDownloadEpisode: payload => ipcRenderer.invoke('creator:advance-download-episode', payload),
+  onDownloadEpisodesChanged: callback => subscribe('creator:download-episodes-changed', callback),
+  addCustomService: service => ipcRenderer.invoke('creator:add-custom-service', service),
+  renameService: (serviceId, name) => ipcRenderer.invoke('creator:rename-service', { serviceId, name }),
+  renameTab: (tabId, name) => ipcRenderer.invoke('creator:rename-tab', { tabId, name }),
+  removeCustomService: serviceId => ipcRenderer.invoke('creator:remove-custom-service', serviceId),
+  removeService: serviceId => ipcRenderer.invoke('creator:remove-service', serviceId),
+  restoreBuiltinService: serviceId => ipcRenderer.invoke('creator:restore-builtin-service', serviceId),
+  restoreBuiltinServices: () => ipcRenderer.invoke('creator:restore-builtin-services'),
+  setAssetPanel: patch => ipcRenderer.invoke('creator:set-asset-panel', patch),
+  focusAssetInLibrary: (assetPath, projectId) => ipcRenderer.invoke('asset:focus-asset', { path: assetPath, projectId }),
+  selectService: (serviceId, mode) => ipcRenderer.invoke('creator:select-service', { serviceId, mode }),
+  setMode: (mode, serviceId) => ipcRenderer.invoke('creator:set-mode', { mode, serviceId }),
+  openTab: (serviceId, mode, afterTabId) => ipcRenderer.invoke('creator:open-tab', { serviceId, mode, afterTabId }),
+  selectTab: tabId => ipcRenderer.invoke('creator:select-tab', { tabId }),
+  reorderTabs: payload => ipcRenderer.invoke('creator:reorder-tabs', payload),
+  pinTab: (tabId, pinned) => ipcRenderer.invoke('creator:pin-tab', { tabId, pinned }),
+  setTabMuted: (tabId, muted) => ipcRenderer.invoke('creator:set-tab-muted', { tabId, muted }),
+  restoreClosedTab: () => ipcRenderer.invoke('creator:restore-closed-tab'),
+  closeOtherTabs: (tabId, scope) => ipcRenderer.invoke('creator:close-other-tabs', { tabId, scope }),
+  cycleTab: offset => ipcRenderer.invoke('creator:cycle-tab', { offset }),
+  findInPage: (text, forward, findNext) => ipcRenderer.invoke('creator:find-in-page', { text, forward, findNext }),
+  stopFindInPage: keepSelection => ipcRenderer.invoke('creator:find-stop', keepSelection),
+  onNotice: callback => subscribe('creator:notice', callback),
+  onShowFindBar: callback => subscribe('creator:show-find-bar', callback),
+  onFindResult: callback => subscribe('creator:find-result', callback),
+  onFocusAddress: callback => subscribe('creator:focus-address', callback),
+  closeTab: tabId => ipcRenderer.invoke('creator:close-tab', { tabId }),
+  clearTabs: () => ipcRenderer.invoke('creator:clear-tabs'),
+  setBrowserBounds: bounds => ipcRenderer.invoke('creator:set-browser-bounds', bounds),
+  setSplitView: payload => ipcRenderer.invoke('creator:set-split-view', payload),
+  setSplitRatio: ratio => ipcRenderer.invoke('creator:set-split-ratio', ratio),
+  focusSplitPane: pane => ipcRenderer.invoke('creator:focus-split-pane', pane),
+  closeSplitView: () => ipcRenderer.invoke('creator:set-split-view', { enabled: false }),
+  navigate: action => ipcRenderer.invoke('creator:navigate', action),
+  navigateUrl: address => ipcRenderer.invoke('creator:navigate-url', address),
+  openExternal: () => ipcRenderer.invoke('creator:open-external'),
+  importFiles: mode => ipcRenderer.invoke('creator:import-files', mode),
+  importAssets: () => ipcRenderer.invoke('creator:import-assets'),
+  getPathForFile: file => webUtils.getPathForFile(file),
+  importDroppedAssets: payload => ipcRenderer.invoke('creator:import-dropped-assets', payload),
+  copyAsset: assetPath => ipcRenderer.invoke('creator:copy-creative-asset', { path: assetPath }),
+  startAssetDrag: assetPath => ipcRenderer.send('creator:start-asset-drag', assetPath && typeof assetPath === 'object' ? assetPath : { path: assetPath }),
+  startAssetDragSelection: paths => ipcRenderer.send('creator:start-asset-drag', { paths }),
+  onAssetDragResult: callback => subscribe('creator:asset-drag-result', callback),
+  // 单视频置顶浮窗：右键左栏视频卡 → 浮到屏幕最顶层 → 从浮窗原生拖进剪映。
+  // 主进程按当前剧本校验，只接受真实视频文件；成功返回 {path}，失败 reject（调用方给提示）。
+  // 浮窗任何方式关闭后回发 creator:float-video-closed {path}，左栏据此还原卡片状态。
+  floatVideoAsset: relativePath => ipcRenderer.invoke('creator:float-video', relativePath && typeof relativePath === 'object' ? relativePath : { path: relativePath }),
+  onFloatVideoClosed: callback => subscribe('creator:float-video-closed', callback),
+  deleteAsset: assetPath => ipcRenderer.invoke('creator:delete-creative-asset', { path: assetPath }),
+  showFolderMenu: payload => ipcRenderer.invoke('asset:folder-menu', payload),
+  renameFolder: payload => ipcRenderer.invoke('asset:rename-folder', payload),
+  deleteBrowserDownload: assetPath => ipcRenderer.invoke('creator:delete-browser-download', { path: assetPath }),
+  pageZoom: action => ipcRenderer.invoke('creator:page-zoom', { action }),
+  setPlatformViewHidden: hidden => ipcRenderer.invoke('creator:set-platform-view-hidden', { hidden }),
+  onPlatformBackdrop: callback => subscribe('creator:platform-backdrop', callback),
+  openFolder: kind => ipcRenderer.invoke('creator:open-folder', kind),
+  openDownload: downloadId => ipcRenderer.invoke('creator:open-download', downloadId),
+  showCreativeAsset: assetPath => ipcRenderer.invoke('creator:show-creative-asset', { path: assetPath }),
+  saveAudioAs: assetPath => ipcRenderer.invoke('creator:export-audio', { path: assetPath }),
+  downloadAction: (downloadId, action) => ipcRenderer.invoke('creator:download-action', { downloadId, action }),
+  focusBrowser: () => ipcRenderer.invoke('creator:focus-browser'),
+  showMainWindow: () => ipcRenderer.invoke('creator:show-main-window'),
+  showProjectPicker: mode => ipcRenderer.invoke('creator:show-project-picker', mode),
+  showProjectMenu: options => ipcRenderer.invoke('creator:show-project-menu', options),
+  showWorkspaceMenu: payload => ipcRenderer.invoke('creator:show-workspace-menu', payload),
+  closeWorkspaceMenu: () => ipcRenderer.invoke('creator:close-workspace-menu'),
+  selectProject: options => ipcRenderer.invoke('creator:select-project', options),
+  showProjectTemplateMenu: options => ipcRenderer.invoke('creator:show-project-template-menu', options),
+  showTabContextMenu: payload => ipcRenderer.invoke('creator:show-tab-menu', payload),
+  getDownloads: () => ipcRenderer.invoke('creator:get-downloads'),
+  onBrowserState: callback => subscribe('creator:browser-state', callback),
+  onDownload: callback => subscribe('creator:download', callback),
+  onSetMode: callback => subscribe('creator:set-mode', callback),
+  onProjectChanged: callback => subscribe('creator:project-changed', callback),
+  onAssetPanelState: callback => subscribe('creator:asset-panel-state', callback),
+}));
